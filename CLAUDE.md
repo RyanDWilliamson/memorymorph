@@ -38,7 +38,7 @@ values.
 | Overdrive / soft clip | `daisysp::Overdrive` |
 | Pitch shifter | `daisysp::PitchShifter` |
 | Reverb | `daisysp::ReverbSc` |
-| DC blocker | `daisysp::DCBlock` |
+| DC blocker | `daisysp::DcBlock` |
 | LFO oscillator | `daisysp::Oscillator` |
 
 ## Makefile

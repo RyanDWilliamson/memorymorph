@@ -1,21 +1,15 @@
 TARGET = MemoryMorph
 
-CPP_SOURCES = memory_morph.cpp \
-              ../hothouse.cpp
+CPP_SOURCES = memory_morph.cpp ../hothouse.cpp
+
+C_INCLUDES = -I.. -I../../DaisySP/DaisySP-LGPL/Source
 
 LIBDAISY_DIR = ../../libDaisy
 DAISYSP_DIR  = ../../DaisySP
 
-C_INCLUDES += \
-  -I.. \
-  -I$(DAISYSP_DIR)/Source \
-  -I$(LIBDAISY_DIR)/src \
-  -I$(LIBDAISY_DIR)/src/sys \
-  -I$(LIBDAISY_DIR)/src/usbd \
-  -I$(LIBDAISY_DIR)/Drivers/CMSIS/Include \
-  -I$(LIBDAISY_DIR)/Drivers/CMSIS/DSP/Include \
-  -I$(LIBDAISY_DIR)/Drivers/STM32H7xx_HAL_Driver/Inc \
-  -I$(LIBDAISY_DIR)/Drivers/BSP/Components/wm8994 \
-  -I$(LIBDAISY_DIR)/core
+# Enable LGPL modules (ReverbSc lives here)
+USE_DAISYSP_LGPL = 1
+C_DEFS += -DUSE_DAISYSP_LGPL
 
-include $(LIBDAISY_DIR)/core/Makefile
+SYSTEM_FILES_DIR = $(LIBDAISY_DIR)/core
+include $(SYSTEM_FILES_DIR)/Makefile

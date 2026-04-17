@@ -41,7 +41,7 @@ using daisy::Led;
 using daisy::Parameter;
 using daisy::SaiHandle;
 using daisy::System;
-using daisysp::DCBlock;
+using daisysp::DcBlock;
 using daisysp::DelayLine;
 using daisysp::Oscillator;
 using daisysp::Overdrive;
@@ -71,7 +71,7 @@ static PitchShifter pitch;
 // ── Other DSP objects ─────────────────────────────────────────────────────────
 
 static Hothouse    hw;
-static DCBlock     dc_block;
+static DcBlock     dc_block;
 static Overdrive   drive;       // Tape / soft-clip saturation
 static Wavefolder  folder;      // Warm / wavefolding saturation
 static Svf         tone_filter; // Post-saturation LPF/HPF (KNOB_5)
@@ -334,7 +334,7 @@ int main() {
 
   // ── DSP init ─────────────────────────────────────────────────────────────────
 
-  dc_block.Init();
+  dc_block.Init(sr);
 
   drive.Init();
   drive.SetDrive(0.5f);
