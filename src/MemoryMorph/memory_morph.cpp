@@ -115,6 +115,13 @@ static volatile float    tap_tempo_s  = 0.f;     // computed tap interval in sec
 static volatile bool     tap_active   = false;   // true = use tap tempo instead of knob
 static volatile uint32_t tap_blink_ms = 0;       // LED blink timestamp
 
+// FS1 disambiguation: short press = tap tempo; hold ≥ 1500 ms = momentary freeze.
+// 1500 ms threshold allows tapping down to 40 BPM without triggering freeze.
+static volatile bool     fs1_is_freeze   = false;  // true while held in freeze
+static volatile uint32_t fs1_press_start = 0;      // timestamp of most recent press
+static volatile bool     fs1_was_pressed = false;  // previous Pressed() state
+static volatile uint32_t fs1_last_tap_ms = 0;      // press timestamp of previous tap
+
 // ── MORPH parameter interpolation ────────────────────────────────────────────
 //
 // Three anchor structs define the sonic character at Morph = 0, 0.5, and 1.
@@ -210,20 +217,46 @@ void AudioCallback(AudioHandle::InputBuffer  in,
   // Always call ProcessAllControls() first.
   hw.ProcessAllControls();
 
-  // ── FS1 tap tempo detection (rising edge = new tap) ────────────────────────
-  // Uses RisingEdge() which fires once on press — doesn't conflict with
-  // momentary freeze (Pressed()) or the callback system.
-  if (hw.switches[Hothouse::FOOTSWITCH_1].RisingEdge()) {
-    static uint32_t last_tap_ms = 0;
-    const uint32_t now_ms = System::GetNow();
-    const uint32_t delta  = now_ms - last_tap_ms;
-    last_tap_ms  = now_ms;
-    tap_blink_ms = now_ms;
-    // Valid tap: 50 ms – 2000 ms (30–1200 BPM)
-    if (delta >= 50 && delta <= 2000) {
-      tap_tempo_s = static_cast<float>(delta) * 0.001f;
-      tap_active  = true;
+  // ── FS1: short press = tap tempo; hold ≥ 1500 ms = momentary freeze ─────────
+  // Decision is made on RELEASE — so any musical tempo tap (even slow, 40 BPM)
+  // is unambiguous. Interval is measured press-to-press so you tap in time.
+  {
+    const bool     fs1_now = hw.switches[Hothouse::FOOTSWITCH_1].Pressed();
+    const uint32_t now_ms  = System::GetNow();
+
+    if (fs1_now && !fs1_was_pressed)
+      fs1_press_start = now_ms;  // rising edge: record when press started
+
+    // Transition to freeze once held long enough (but not if still tapping)
+    if (fs1_now && !fs1_is_freeze && (now_ms - fs1_press_start) >= 1500)
+      fs1_is_freeze = true;
+
+    if (!fs1_now && fs1_was_pressed) {
+      // Falling edge: classify the press
+      if (fs1_is_freeze) {
+        fs1_is_freeze = false;  // release freeze on lift
+      } else {
+        // Short press → tap tempo (press-to-press interval).
+        // Minimum 80 ms (750 BPM) allows slapback taps.
+        // Only update fs1_last_tap_ms on a VALID tap so rapid re-tapping
+        // after a slow tempo converges correctly (doesn't reset reference
+        // against rejected taps and lock you out of fast tempos).
+        const uint32_t interval = fs1_press_start - fs1_last_tap_ms;
+        tap_blink_ms = now_ms;
+        if (interval >= 80 && interval <= 1500) {
+          tap_tempo_s     = static_cast<float>(interval) * 0.001f;
+          tap_active      = true;
+          fs1_last_tap_ms = fs1_press_start;  // only advance on valid tap
+        } else if (interval > 1500) {
+          // First tap after a long pause — reset reference without setting tempo
+          fs1_last_tap_ms = fs1_press_start;
+        }
+        // If interval < 80 ms: too fast, ignore AND keep old reference so
+        // the next tap measures from the last valid press, not this one.
+      }
     }
+
+    fs1_was_pressed = fs1_now;
   }
 
   // ── Read all parameters once per block ──────────────────────────────────────
@@ -253,10 +286,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
   smooth_time  += 0.01f * (time_target - smooth_time);
   const float time_s = smooth_time;
 
-  // Momentary freeze: hold FS1 = freeze (infinite feedback + reverb decay)
-  // Ramp freeze_blend over ~10 ms (coeff 0.002 at 48 kHz / 48-sample blocks)
-  // to avoid pops from instant parameter jumps.
-  const float freeze_target = hw.switches[Hothouse::FOOTSWITCH_1].Pressed() ? 1.f : 0.f;
+  // Freeze: ramp smoothly over ~10 ms to avoid pops on engage/release.
+  const float freeze_target = fs1_is_freeze ? 1.f : 0.f;
   freeze_blend += 0.002f * (freeze_target - freeze_blend);
   const bool frozen_now = freeze_blend > 0.5f;
 
@@ -349,14 +380,19 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // DC block (removes low-frequency offset from guitar pickups)
     float sig = dc_block.Process(dry);
 
-    // ── Saturation stage (unity gain) ──────────────────────────────────────────
-    // Overdrive/fold can add gain; tanhf after the blend keeps the peak at
-    // ±1 so downstream reverb+shimmer see a consistent input level regardless
-    // of saturation mode or morph position.
+    // ── Saturation stage ───────────────────────────────────────────────────────
+    // Overdrive at drive=0.5 has ~24× pre-gain: compresses even weak guitar
+    // signals to near ±1. Warm and Clean need heavy makeup to match that level.
+    // Tape (UP):   reference — clips to ±1 via Overdrive.
+    // Warm (MID):  Wavefolder is near-linear at typical guitar levels → ×3.5 makeup.
+    // Clean (DOWN): pure passthrough → ×4.5 makeup; tanhf stays transparent below ~0.4.
     float sat;
-    if      (sw1 == Hothouse::TOGGLESWITCH_UP)     sat = tanhf(lerpf(sig, drive.Process(sig), mp.sat_drive));
-    else if (sw1 == Hothouse::TOGGLESWITCH_MIDDLE)  sat = tanhf(lerpf(sig, folder.Process(sig), mp.sat_drive));
-    else                                             sat = sig;
+    if      (sw1 == Hothouse::TOGGLESWITCH_UP)
+      sat = tanhf(lerpf(sig, drive.Process(sig), mp.sat_drive));
+    else if (sw1 == Hothouse::TOGGLESWITCH_MIDDLE)
+      sat = tanhf(lerpf(sig, folder.Process(sig), mp.sat_drive) * 3.5f);
+    else
+      sat = tanhf(sig * 4.5f);
 
     // ── Tone filter ────────────────────────────────────────────────────────────
     tone_filter.Process(sat);
@@ -546,10 +582,9 @@ int main() {
       } else if (bypass) {
         led1_brightness = 0.f;
         led_lfo_phase   = 0.f;
-      } else if (hw.switches[Hothouse::FOOTSWITCH_1].Pressed()) {
-        led_lfo_phase += 0.4f * 0.001f;  // 0.4 Hz at 1 kHz tick
-        if (led_lfo_phase >= 1.f) led_lfo_phase -= 1.f;
-        led1_brightness = 0.5f + 0.5f * sinf(led_lfo_phase * kTwoPi);
+      } else if (fs1_is_freeze) {
+        led1_brightness = 1.f;  // Solid on while frozen
+        led_lfo_phase   = 0.f;
       } else {
         // Sync LED pulse to mod LFO: read current knob values directly
         // (safe from main loop; ADC is running and these are last-sampled values)
