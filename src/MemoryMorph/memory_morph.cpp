@@ -45,7 +45,6 @@ using daisy::System;
 using daisysp::DcBlock;
 using daisysp::DelayLine;
 using daisysp::Oscillator;
-using daisysp::Overdrive;
 using daisysp::PitchShifter;
 using daisysp::ReverbSc;
 using daisysp::Svf;
@@ -73,7 +72,6 @@ static PitchShifter pitch;
 
 static Hothouse    hw;
 static DcBlock     dc_block;
-static Overdrive   drive;       // Tape / soft-clip saturation
 static Wavefolder  folder;      // Warm / wavefolding saturation
 static Svf         tone_filter; // Post-saturation LPF/HPF (KNOB_5)
 static Oscillator  mod_lfo;     // Delay-time modulation LFO
@@ -98,6 +96,20 @@ static volatile bool bypass = false;  // start active — LED_2 lights on boot
 
 // Shimmer feedback sample (read and written each audio sample)
 static float shimmer_buf = 0.f;
+
+// ── Custom tape saturator state ───────────────────────────────────────────────
+// tape_hpf_z: one-pole LPF state used to derive a pre-emphasis HPF (~3 kHz).
+// tape_lpf_z: one-pole LPF for post-saturation head-gap rolloff (~8 kHz).
+// Coefficients (tape_hpf_c, tape_lpf_c) computed in main() from sample rate.
+static float tape_hpf_z = 0.f;
+static float tape_lpf_z = 0.f;
+static float tape_hpf_c = 0.f;
+static float tape_lpf_c = 0.f;
+
+// ── BBD delay bandwidth state ─────────────────────────────────────────────────
+// One-pole LPF on the delay write path; cutoff narrows with longer delay time,
+// matching real bucket-brigade (MN3005) bandwidth characteristics.
+static float bbd_lpf_z = 0.f;
 
 // Envelope follower for shimmer auto-ducking — tracks reverb output level
 // and gently reduces shimmer feedback when the loop gets hot. Creates a
@@ -209,6 +221,36 @@ static void OnLongPress(Hothouse::Switches /*fsw*/) {
   // DFU is handled by 10 s hold detection in the main loop instead
 }
 
+// ── Custom tape saturator ─────────────────────────────────────────────────────
+//
+// Three-stage model of magnetic tape saturation:
+//   1. HF pre-emphasis   — one-pole HPF (~3 kHz) boosts high-shelf content
+//                          before the clip; ferric oxide saturates HF first.
+//   2. Asymmetric tanhf  — 0.18 DC bias shifts the operating point, adding
+//                          2nd harmonic richness characteristic of tape bias.
+//   3. Post-saturation LPF — ~8 kHz rolloff simulates tape head gap loss.
+//
+// Output is bounded within ±1 by the internal tanhf.
+// Filter states (tape_hpf_z, tape_lpf_z) and coefficients are file-scope
+// statics so they persist between callback invocations.
+static inline float TapeSatProcess(float x) {
+  // 1. Pre-emphasis: LPF gives the low shelf; HF = x − shelf
+  tape_hpf_z          = tape_hpf_c * tape_hpf_z + (1.f - tape_hpf_c) * x;
+  const float hf      = x - tape_hpf_z;    // high-shelf content above ~3 kHz
+  const float boosted = x + hf * 0.6f;     // HF boosted 1.6× before clip
+
+  // 2. Asymmetric saturation: DC bias creates even harmonics (tape bias).
+  //    kBiasComp subtracts the idle DC so output is zero at zero input.
+  static constexpr float kPreGain  = 18.f;
+  static constexpr float kBias     = 0.18f;
+  static constexpr float kBiasComp = 0.17928f;  // ≈ tanhf(kBias), precomputed
+  const float clipped = tanhf(boosted * kPreGain + kBias) - kBiasComp;
+
+  // 3. Post-saturation rolloff: tape head gap loss (~8 kHz)
+  tape_lpf_z += tape_lpf_c * (clipped - tape_lpf_z);
+  return tape_lpf_z;
+}
+
 // ── Audio callback ─────────────────────────────────────────────────────────────
 
 void AudioCallback(AudioHandle::InputBuffer  in,
@@ -302,9 +344,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
   // ── Update DSP module parameters ─────────────────────────────────────────────
 
-  // Saturation drive (Overdrive and Wavefolder both updated; only one is used
-  // per sample depending on sw1, but updating both is cheap and avoids pops).
-  drive.SetDrive(0.5f);
+  // Wavefolder gain is fixed for Warm mode character
   folder.SetGain(2.25f);
 
   // Tone filter res is constant
@@ -328,6 +368,12 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
   // Delay time in samples
   const float base_delay_smp = time_s * static_cast<float>(kSampleRate);
+
+  // BBD bandwidth: cutoff narrows with longer delay time, matching real
+  // bucket-brigade (MN3005) chip behaviour — 9 kHz at 50 ms, 4 kHz at 1 s.
+  // expf is computed block-rate (once per 48 samples) then applied per-sample.
+  const float bbd_cutoff = fminf(9000.f, fmaxf(2000.f, 4000.f / time_s));
+  const float bbd_c      = 1.f - expf(-kTwoPi * bbd_cutoff / static_cast<float>(kSampleRate));
 
   // ── Per-sample DSP loop ───────────────────────────────────────────────────────
 
@@ -372,6 +418,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
       float vL, vR;
       reverb.Process(0.f, 0.f, &vL, &vR);
       shimmer_buf = 0.f;
+      tape_hpf_z  = 0.f;  // drain filter states to prevent click on re-engage
+      tape_lpf_z  = 0.f;
+      bbd_lpf_z   = 0.f;
       out[0][i] = dry;
       out[1][i] = dry;
       continue;
@@ -381,14 +430,12 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     float sig = dc_block.Process(dry);
 
     // ── Saturation stage ───────────────────────────────────────────────────────
-    // Overdrive at drive=0.5 has ~24× pre-gain: compresses even weak guitar
-    // signals to near ±1. Warm and Clean need heavy makeup to match that level.
-    // Tape (UP):   reference — clips to ±1 via Overdrive.
-    // Warm (MID):  Wavefolder is near-linear at typical guitar levels → ×3.5 makeup.
-    // Clean (DOWN): pure passthrough → ×4.5 makeup; tanhf stays transparent below ~0.4.
+    // Tape (UP):   custom TapeSat — HF pre-emphasis, asymmetric bias clip, head rolloff.
+    // Warm (MID):  Wavefolder (Memory Man fold character) + ×3.5 makeup.
+    // Clean (DOWN): passthrough + ×4.5 makeup; tanhf transparent below ~0.4.
     float sat;
-    if      (sw1 == Hothouse::TOGGLESWITCH_UP)
-      sat = tanhf(lerpf(sig, drive.Process(sig), mp.sat_drive));
+    if (sw1 == Hothouse::TOGGLESWITCH_UP)
+      sat = tanhf(lerpf(sig, TapeSatProcess(sig), mp.sat_drive));
     else if (sw1 == Hothouse::TOGGLESWITCH_MIDDLE)
       sat = tanhf(lerpf(sig, folder.Process(sig), mp.sat_drive) * 3.5f);
     else
@@ -414,7 +461,10 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // During freeze, fade new input to zero so delay just recirculates.
     // freeze_blend ramps smoothly 0→1 to avoid pops.
     const float delay_input = tape_out * (1.f - freeze_blend);
-    delay_line.Write(delay_input + delay_out * fb);
+    // BBD bandwidth: LPF colours the write path, cutoff = bbd_c computed block-rate.
+    // At short times: near-transparent (9 kHz). At long times: dark (2–4 kHz).
+    bbd_lpf_z += bbd_c * (delay_input - bbd_lpf_z);
+    delay_line.Write(bbd_lpf_z + delay_out * fb);
 
     // ── Reverb + shimmer feedback loop ────────────────────────────────────────
     //
@@ -512,12 +562,15 @@ int main() {
 
   dc_block.Init(sr);
 
-  drive.Init();
-  drive.SetDrive(0.5f);
-
   folder.Init();
   folder.SetGain(1.f);
   folder.SetOffset(0.f);
+
+  // Tape saturator filter coefficients
+  // tape_hpf_c: one-pole LPF at 3 kHz — subtracted from input to give HPF (pre-emphasis)
+  // tape_lpf_c: one-pole LPF at 8 kHz — post-saturation head-gap rolloff
+  tape_hpf_c = expf(-kTwoPi * 3000.f / sr);
+  tape_lpf_c = 1.f - expf(-kTwoPi * 8000.f / sr);
 
   tone_filter.Init(sr);
   tone_filter.SetFreq(8000.f);
