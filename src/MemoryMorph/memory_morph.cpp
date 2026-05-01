@@ -18,8 +18,8 @@
 //   KNOB_5  Tone         — LPF cutoff 800 Hz – 18 kHz (log)
 //   KNOB_6  Mix          — dry/wet blend
 //
-//   TOGGLESWITCH_1  Saturation character
-//                   UP=Tape (soft clip)  MID=Warm (fold)  DOWN=Clean
+//   TOGGLESWITCH_1  DMM input drive level (all modes use the same circuit model)
+//                   UP=High drive  MID=Med drive  DOWN=Low drive
 //   TOGGLESWITCH_2  Modulation type
 //                   UP=Chorus  MID=Vibrato  DOWN=Wow/Flutter
 //   TOGGLESWITCH_3  Reverb tail
@@ -48,7 +48,6 @@ using daisysp::Oscillator;
 using daisysp::PitchShifter;
 using daisysp::ReverbSc;
 using daisysp::Svf;
-using daisysp::Wavefolder;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -60,19 +59,23 @@ static constexpr float    kTwoPi       = 6.28318530718f;
 // Omitting DSY_SDRAM_BSS causes a hard fault at Init().
 
 static DelayLine<float, kMaxDelaySmp> DSY_SDRAM_BSS delay_line;
-static ReverbSc                       DSY_SDRAM_BSS reverb;
 
-// PitchShifter holds two 16384-float delay lines (~128 KB).
-// At 96 kHz the grain window is ~171 ms (vs ~341 ms at 48 kHz) — slightly
-// brighter shimmer character but functionally correct.
-// Move to SDRAM with DSY_SDRAM_BSS if internal SRAM runs short.
-static PitchShifter pitch;
+// ReverbSc holds aux_[98936] (~387 KB) with 8 delay taps at random offsets.
+// Random-access cache-miss pattern: placing this in AXI SRAM (RAM_D1, 512 KB)
+// costs only ~3–5 AXI cycles per miss vs ~30–60 CPU cycles for SDRAM.
+// Total BSS without DSY_SDRAM_BSS: ~279 KB — well within the 512 KB RAM_D1.
+static ReverbSc reverb;
+
+// PitchShifter holds two DelayLine<float,16384> (~128 KB total).
+// Its grain algorithm sweeps sequentially, so SDRAM burst-read latency is
+// amortised — far more cache-friendly in SDRAM than the reverb's scatter reads.
+// Only active when shimmer is on, so SDRAM pressure is limited to Ambient zone.
+static PitchShifter DSY_SDRAM_BSS pitch;
 
 // ── Other DSP objects ─────────────────────────────────────────────────────────
 
 static Hothouse    hw;
 static DcBlock     dc_block;
-static Wavefolder  folder;      // Warm / wavefolding saturation
 static Svf         tone_filter; // Post-saturation LPF/HPF (KNOB_5)
 static Oscillator  mod_lfo;     // Delay-time modulation LFO
 
@@ -98,18 +101,30 @@ static volatile bool bypass = false;  // start active — LED_2 lights on boot
 static float shimmer_buf = 0.f;
 
 // ── Custom tape saturator state ───────────────────────────────────────────────
-// tape_hpf_z: one-pole LPF state used to derive a pre-emphasis HPF (~3 kHz).
-// tape_lpf_z: one-pole LPF for post-saturation head-gap rolloff (~8 kHz).
-// Coefficients (tape_hpf_c, tape_lpf_c) computed in main() from sample rate.
-static float tape_hpf_z = 0.f;
-static float tape_lpf_z = 0.f;
-static float tape_hpf_c = 0.f;
-static float tape_lpf_c = 0.f;
+
 
 // ── BBD delay bandwidth state ─────────────────────────────────────────────────
 // One-pole LPF on the delay write path; cutoff narrows with longer delay time,
 // matching real bucket-brigade (MN3005) bandwidth characteristics.
 static float bbd_lpf_z = 0.f;
+
+// ── SA571 compander state ─────────────────────────────────────────────────────
+// Squared-signal RMS envelope detector for the compressor (before BBD).
+// Attack ~5 ms / release ~60 ms — matches real SA571 time constants.
+static float comp_env_sq = 0.f;
+
+// ── Anti-alias / anti-image 2-pole Butterworth LPF ───────────────────────────
+// Before BBD (aa): prevents aliasing. After BBD (ai): reconstruction filter.
+// Direct-form II transposed biquad. Coefficients computed in main() at 8 kHz.
+static float aa_w1 = 0.f, aa_w2 = 0.f;
+static float ai_w1 = 0.f, ai_w2 = 0.f;
+static float aa_b0, aa_b1, aa_b2, aa_a1, aa_a2;  // shared by both filters
+
+// ── Feedback path LPF ─────────────────────────────────────────────────────────
+// One-pole at ~5 kHz in the delay feedback path — darkens each successive repeat,
+// one of the defining characters of the real DMM at long echo times.
+static float fb_lpf_z = 0.f;
+static float fb_lpf_c = 0.f;  // coefficient computed in main()
 
 // Envelope follower for shimmer auto-ducking — tracks reverb output level
 // and gently reduces shimmer feedback when the loop gets hot. Creates a
@@ -145,7 +160,6 @@ static volatile uint32_t fs1_last_tap_ms = 0;      // press timestamp of previou
 struct MorphParams {
   float delay_send;       // 0–1  how much delay is added to the wet signal
   float reverb_send;      // 0–1  how much of the delay+sat goes into reverb
-  float sat_drive;        // 0–1  overdrive / fold drive amount
   float mod_depth_scale;  // 0–1  scales KNOB_4 raw depth value
   float reverb_decay;     // 0.6–0.999  reverb feedback / decay time
   float reverb_lpf_hz;    // Hz  reverb high-frequency damping
@@ -155,7 +169,6 @@ struct MorphParams {
 static constexpr MorphParams kAnchorTape = {
     /*delay_send=*/0.00f,
     /*reverb_send=*/0.00f,
-    /*sat_drive=*/0.50f,
     /*mod_depth_scale=*/0.00f,
     /*reverb_decay=*/0.75f,
     /*reverb_lpf_hz=*/9000.f,
@@ -166,7 +179,6 @@ static constexpr MorphParams kAnchorTape = {
 static constexpr MorphParams kAnchorEcho = {
     /*delay_send=*/1.00f,
     /*reverb_send=*/0.30f,
-    /*sat_drive=*/0.25f,
     /*mod_depth_scale=*/0.50f,
     /*reverb_decay=*/0.78f,
     /*reverb_lpf_hz=*/8500.f,
@@ -178,7 +190,6 @@ static constexpr MorphParams kAnchorEcho = {
 static constexpr MorphParams kAnchorAmbient = {
     /*delay_send=*/1.00f,
     /*reverb_send=*/1.00f,
-    /*sat_drive=*/0.25f,
     /*mod_depth_scale=*/1.00f,
     /*reverb_decay=*/0.95f,
     /*reverb_lpf_hz=*/4000.f,
@@ -193,7 +204,6 @@ static MorphParams LerpParams(const MorphParams& a, const MorphParams& b,
   return {
       lerpf(a.delay_send,       b.delay_send,       t),
       lerpf(a.reverb_send,      b.reverb_send,      t),
-      lerpf(a.sat_drive,        b.sat_drive,        t),
       lerpf(a.mod_depth_scale,  b.mod_depth_scale,  t),
       lerpf(a.reverb_decay,     b.reverb_decay,     t),
       lerpf(a.reverb_lpf_hz,    b.reverb_lpf_hz,    t),
@@ -221,34 +231,40 @@ static void OnLongPress(Hothouse::Switches /*fsw*/) {
   // DFU is handled by 10 s hold detection in the main loop instead
 }
 
-// ── Custom tape saturator ─────────────────────────────────────────────────────
-//
-// Three-stage model of magnetic tape saturation:
-//   1. HF pre-emphasis   — one-pole HPF (~3 kHz) boosts high-shelf content
-//                          before the clip; ferric oxide saturates HF first.
-//   2. Asymmetric tanhf  — 0.18 DC bias shifts the operating point, adding
-//                          2nd harmonic richness characteristic of tape bias.
-//   3. Post-saturation LPF — ~8 kHz rolloff simulates tape head gap loss.
-//
-// Output is bounded within ±1 by the internal tanhf.
-// Filter states (tape_hpf_z, tape_lpf_z) and coefficients are file-scope
-// statics so they persist between callback invocations.
-static inline float TapeSatProcess(float x) {
-  // 1. Pre-emphasis: LPF gives the low shelf; HF = x − shelf
-  tape_hpf_z          = tape_hpf_c * tape_hpf_z + (1.f - tape_hpf_c) * x;
-  const float hf      = x - tape_hpf_z;    // high-shelf content above ~3 kHz
-  const float boosted = x + hf * 0.6f;     // HF boosted 1.6× before clip
+// ── DMM DSP helpers ───────────────────────────────────────────────────────────
 
-  // 2. Asymmetric saturation: DC bias creates even harmonics (tape bias).
-  //    kBiasComp subtracts the idle DC so output is zero at zero input.
-  static constexpr float kPreGain  = 18.f;
-  static constexpr float kBias     = 0.18f;
-  static constexpr float kBiasComp = 0.17928f;  // ≈ tanhf(kBias), precomputed
-  const float clipped = tanhf(boosted * kPreGain + kBias) - kBiasComp;
+// 2-pole Butterworth LPF — direct-form II transposed biquad.
+// w1/w2 are the two state variables (persist across calls).
+// Coefficients (b0,b1,b2,a1,a2) are computed once in main() from sample rate.
+static inline float BiquadLP(float x, float& w1, float& w2,
+                              float b0, float b1, float b2,
+                              float a1, float a2) {
+  const float y = b0 * x + w1;
+  w1 = b1 * x - a1 * y + w2;
+  w2 = b2 * x - a2 * y;
+  return y;
+}
 
-  // 3. Post-saturation rolloff: tape head gap loss (~8 kHz)
-  tape_lpf_z += tape_lpf_c * (clipped - tape_lpf_z);
-  return tape_lpf_z;
+// SA571 compressor — RMS-based 2:1 gain reduction before the BBD.
+// Pre-gain scales input to the desired drive level; the compressor then
+// prevents the BBD from seeing signals larger than ~±1.
+// kTarget: RMS level the compressor aims to hold at its output.
+// Returns the compressed sample; updates comp_env_sq in-place.
+static constexpr float kCompTarget    = 0.25f;    // ~–12 dBFS RMS target
+static constexpr float kCompAttack    = 0.004158f; // ~5 ms at 48 kHz  [1-exp(-1/(0.005*48000))]
+static constexpr float kCompRelease   = 0.000347f; // ~60 ms at 48 kHz [1-exp(-1/(0.060*48000))]
+static constexpr float kCompMaxGain   = 2.5f;      // punchy but not harsh at hot input
+static constexpr float kCompMinGain   = 0.1f;
+
+static inline float DmmCompress(float x) {
+  const float x2 = x * x;
+  if (x2 > comp_env_sq)
+    comp_env_sq += kCompAttack   * (x2 - comp_env_sq);
+  else
+    comp_env_sq += kCompRelease  * (x2 - comp_env_sq);
+  const float rms  = sqrtf(comp_env_sq + 1e-12f);
+  const float gain = fmaxf(kCompMinGain, fminf(kCompMaxGain, kCompTarget / rms));
+  return tanhf(x * gain);  // tanhf here is safe — NOT in a feedback path
 }
 
 // ── Audio callback ─────────────────────────────────────────────────────────────
@@ -256,6 +272,10 @@ static inline float TapeSatProcess(float x) {
 void AudioCallback(AudioHandle::InputBuffer  in,
                    AudioHandle::OutputBuffer out,
                    size_t                    size) {
+  // FPSCR is part of the FPU exception frame on Cortex-M7 and is reset to 0
+  // on every ISR entry — the FZ bit set in main() does NOT carry over here.
+  // Must be set at the top of the callback so every block has flush-to-zero.
+  __set_FPSCR(__get_FPSCR() | (1u << 24));
   // Always call ProcessAllControls() first.
   hw.ProcessAllControls();
 
@@ -319,22 +339,32 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
   // Per-sample smoothing targets — actual smoothing happens inside the DSP loop
   // to avoid the 1 kHz staircase whine that block-rate smoothing produces.
-  static float smooth_morph  = 0.f;
-  static float smooth_mix    = 0.5f;
-  static float smooth_time   = 0.3f;
-  static float smooth_tone   = 4000.f;
+  static float smooth_morph   = 0.f;
+  static float smooth_mix     = 0.5f;
+  static float smooth_time    = 0.3f;
+  static float smooth_tone    = 4000.f;
+  // smooth_repeats: ADC output on KNOB_3 has 1–2 LSB of jitter even when still.
+  // That jitter ± one step per block AM-modulates the delay feedback at 1 kHz,
+  // producing a quiet but audible standing tone at hot input levels with any
+  // feedback. Per-sample smoothing eliminates the jitter; lag is imperceptible.
+  static float smooth_repeats = 0.f;
+
   // Block-rate glide for delay time (tap tempo slide — slow enough to
   // avoid audible doppler chirp when the read head moves)
   smooth_time  += 0.01f * (time_target - smooth_time);
   const float time_s = smooth_time;
+
+  // Block-rate glide for LFO amplitude — without this, turning KNOB_4
+  // causes LFO amplitude to step at 1 kHz, producing audible clicks.
+  static float smooth_depth = 0.f;
+  smooth_depth += 0.02f * (depth - smooth_depth);
 
   // Freeze: ramp smoothly over ~10 ms to avoid pops on engage/release.
   const float freeze_target = fs1_is_freeze ? 1.f : 0.f;
   freeze_blend += 0.002f * (freeze_target - freeze_blend);
   const bool frozen_now = freeze_blend > 0.5f;
 
-  // Freeze: smoothly ramp feedback toward near-infinite
-  const float fb = lerpf(repeats, 0.999f, freeze_blend);
+  // NOTE: fb is computed per-sample inside the loop using smooth_repeats.
 
   // ── Toggle positions ─────────────────────────────────────────────────────────
 
@@ -342,10 +372,45 @@ void AudioCallback(AudioHandle::InputBuffer  in,
   const auto sw2 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2);
   const auto sw3 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3);
 
+  // ── Bypass: block-level early return ─────────────────────────────────────────
+  // Do NOT call reverb.Process() or delay_line operations during bypass.
+  // ReverbSc::NextRandomLineseg() fires periodically (slowest: ~0.891 Hz,
+  // period ~1.12 s) and jumps its read pointer, causing a burst of SDRAM
+  // cache misses that overrun the audio DMA deadline — audible as a pulse
+  // of noise even with dry signal passing through. Early return skips all
+  // DSP and all SDRAM access for the entire block.
+  // Filter states are zeroed here so the chain starts clean on re-engage.
+  if (bypass) {
+    bbd_lpf_z   = 0.f;
+    comp_env_sq = 0.f;
+    aa_w1 = aa_w2 = ai_w1 = ai_w2 = fb_lpf_z = 0.f;
+    shimmer_buf = 0.f;
+    shimmer_env = 0.f;
+    for (size_t i = 0; i < size; ++i) {
+      out[0][i] = in[0][i];
+      out[1][i] = in[0][i];
+    }
+    return;
+  }
+
   // ── Update DSP module parameters ─────────────────────────────────────────────
 
-  // Wavefolder gain is fixed for Warm mode character
-  folder.SetGain(2.25f);
+  // DMM drive level from SW1.
+  // preamp_gain: scales the guitar signal before the compressor.
+  // post_gain: compensates output level so all three positions match at
+  //   nominal guitar volume (~0.2–0.3 peak). Guitar volume controls saturation
+  //   depth within each mode — turn up for more harmonic content.
+  float preamp_gain, post_gain;
+  if (sw1 == Hothouse::TOGGLESWITCH_UP) {
+    // High: overdriven preamp, strong compressor pumping, rich harmonics
+    preamp_gain = 5.0f;  post_gain = 0.60f;
+  } else if (sw1 == Hothouse::TOGGLESWITCH_MIDDLE) {
+    // Med: nominal DMM operating point — punchy, slightly warm
+    preamp_gain = 2.5f;  post_gain = 0.90f;
+  } else {
+    // Low: gentle compression, most transparent; guitar vol drives saturation
+    preamp_gain = 1.2f;  post_gain = 1.15f;
+  }
 
   // Tone filter res is constant
   tone_filter.SetRes(0.f);
@@ -364,7 +429,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
   // Depth is scaled by MORPH so at Tape anchor (morph=0) there is no modulation
   // Use current smooth_morph for block-rate LFO amplitude (doesn't need per-sample)
   const MorphParams mp_lfo = ComputeMorph(smooth_morph);
-  mod_lfo.SetAmp(depth * mp_lfo.mod_depth_scale);
+  mod_lfo.SetAmp(smooth_depth * mp_lfo.mod_depth_scale);
 
   // Delay time in samples
   const float base_delay_smp = time_s * static_cast<float>(kSampleRate);
@@ -377,72 +442,80 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
   // ── Per-sample DSP loop ───────────────────────────────────────────────────────
 
-  // Per-sample smoothing coefficients (~5 ms time constant at 48 kHz)
-  static constexpr float kSmooth = 0.0002f;   // morph, mix
-  static constexpr float kSmoothTone = 0.0002f;
+  // Per-sample smoothing coefficient (~5 ms time constant at 48 kHz)
+  static constexpr float kSmooth = 0.0002f;  // morph, mix, repeats
   static float smooth_verb_lpf = 8500.f;
+
+  // ── Block-rate reverb + tone config ────────────────────────────────────────
+  // reverb.SetFeedback() and SetLpFreq() each recompute an expf() coefficient.
+  // smooth_morph changes < 0.01 per block — computing these once saves 47 expf()
+  // calls per block with no perceptible difference.
+  {
+    const MorphParams mp_b = ComputeMorph(smooth_morph);
+    const float rev_decay_b = lerpf(mp_b.reverb_decay, 0.999f, freeze_blend);
+    float eff_decay_b = rev_decay_b;
+    if (short_plate)
+      eff_decay_b = frozen_now ? 0.999f : fminf(rev_decay_b, 0.80f);
+    const float shimmer_amt_b = shimmer_on ? 0.25f * mp_b.reverb_send : 0.f;
+    if (shimmer_amt_b > 0.001f && !frozen_now)
+      eff_decay_b = fminf(eff_decay_b, 0.93f);
+    reverb.SetFeedback(eff_decay_b);
+    // Gate SetLpFreq: ReverbSc::Process() recomputes cosf()+sqrtf() every time
+    // lpfreq changes. Only push a new value when the glide has moved > 0.5 Hz.
+    const float new_verb_lpf = smooth_verb_lpf + 0.01f * (mp_b.reverb_lpf_hz - smooth_verb_lpf);
+    if (fabsf(new_verb_lpf - smooth_verb_lpf) > 0.5f) {
+      reverb.SetLpFreq(new_verb_lpf);
+    }
+    smooth_verb_lpf = new_verb_lpf;
+  }
+
+  // tone_filter.SetFreq() recomputes SVF coefficients. Advance smooth_tone and
+  // call SetFreq once per block instead of 48× — imperceptible difference.
+  smooth_tone += 0.01f * (tone_hz - smooth_tone);
+  tone_filter.SetFreq(smooth_tone);
 
   for (size_t i = 0; i < size; ++i) {
     const float dry = in[0][i];
 
     // ── Per-sample parameter smoothing (eliminates 1 kHz staircase whine) ──
-    smooth_morph += kSmooth * (morph_raw - smooth_morph);
-    smooth_mix   += kSmooth * (mix_raw   - smooth_mix);
-    smooth_tone  += kSmoothTone * (tone_hz - smooth_tone);
+    smooth_morph   += kSmooth * (morph_raw - smooth_morph);
+    smooth_mix     += kSmooth * (mix_raw   - smooth_mix);
+    smooth_repeats += kSmooth * (repeats   - smooth_repeats);
     const float morph = smooth_morph;
     const float mix   = smooth_mix;
 
+    // fb per-sample: eliminates ADC jitter on KNOB_3 creating a 1 kHz AM tone.
+    const float fb = lerpf(smooth_repeats, 0.999f, freeze_blend);
+
     const MorphParams mp = ComputeMorph(morph);
 
-    // Update tone filter frequency per-sample (smooth)
-    tone_filter.SetFreq(smooth_tone);
-
-    // Reverb parameters — smoothed via morph
-    const float rev_decay = lerpf(mp.reverb_decay, 0.999f, freeze_blend);
-    float eff_decay = rev_decay;
-    if (short_plate)
-      eff_decay = frozen_now ? 0.999f : fminf(rev_decay, 0.80f);
+    // shimmer_amt per-sample from morph (used for mix scaling below).
+    // Reverb API config (SetFeedback / SetLpFreq) is done once per block above.
     const float shimmer_amt = shimmer_on ? 0.25f * mp.reverb_send : 0.f;
-    if (shimmer_amt > 0.001f && !frozen_now)
-      eff_decay = fminf(eff_decay, 0.93f);
-    reverb.SetFeedback(eff_decay);
-    smooth_verb_lpf += kSmooth * (mp.reverb_lpf_hz - smooth_verb_lpf);
-    reverb.SetLpFreq(smooth_verb_lpf);
-
-    if (bypass) {
-      // Drain DSP buffers by feeding silence so they don't build up energy.
-      // This prevents drone when re-engaging the effect.
-      delay_line.SetDelay(base_delay_smp);
-      delay_line.Read();
-      delay_line.Write(0.f);
-      float vL, vR;
-      reverb.Process(0.f, 0.f, &vL, &vR);
-      shimmer_buf = 0.f;
-      tape_hpf_z  = 0.f;  // drain filter states to prevent click on re-engage
-      tape_lpf_z  = 0.f;
-      bbd_lpf_z   = 0.f;
-      out[0][i] = dry;
-      out[1][i] = dry;
-      continue;
-    }
 
     // DC block (removes low-frequency offset from guitar pickups)
     float sig = dc_block.Process(dry);
 
-    // ── Saturation stage ───────────────────────────────────────────────────────
-    // Tape (UP):   custom TapeSat — HF pre-emphasis, asymmetric bias clip, head rolloff.
-    // Warm (MID):  Wavefolder (Memory Man fold character) + ×3.5 makeup.
-    // Clean (DOWN): passthrough + ×4.5 makeup; tanhf transparent below ~0.4.
-    float sat;
-    if (sw1 == Hothouse::TOGGLESWITCH_UP)
-      sat = tanhf(lerpf(sig, TapeSatProcess(sig), mp.sat_drive));
-    else if (sw1 == Hothouse::TOGGLESWITCH_MIDDLE)
-      sat = tanhf(lerpf(sig, folder.Process(sig), mp.sat_drive) * 3.5f);
-    else
-      sat = tanhf(sig * 4.5f);
+    // ── DMM signal chain ──────────────────────────────────────────────────────
+    //
+    // 1. Preamp: scale to drive level, then tanhf for op-amp soft clip.
+    //    tanhf here is the saturation character — NOT in a feedback path,
+    //    so no waveform-flattening accumulation risk.
+    const float preamp_out = tanhf(sig * preamp_gain);
+
+    // 2. SA571 compressor: RMS 2:1 gain reduction before the BBD.
+    //    Attack ~5 ms lets transients punch through (the DMM "snap").
+    //    Release ~60 ms causes the characteristic sag on sustain notes.
+    const float comp_out = DmmCompress(preamp_out) * post_gain;
+
+    // 3. Anti-alias LPF (2-pole Butterworth, 8 kHz) — before BBD write.
+    //    Removes content the BBD can't reproduce; adds the slight HF rolloff
+    //    present on all DMM dry tones even without delay.
+    const float aa_out = BiquadLP(comp_out, aa_w1, aa_w2,
+                                  aa_b0, aa_b1, aa_b2, aa_a1, aa_a2);
 
     // ── Tone filter ────────────────────────────────────────────────────────────
-    tone_filter.Process(sat);
+    tone_filter.Process(aa_out);
     const float tape_out = tone_filter.Low();  // Low-pass output
 
     // ── Delay with LFO modulation ──────────────────────────────────────────────
@@ -457,14 +530,31 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     smooth_delay_smp += 0.0004f * (target_smp - smooth_delay_smp);
 
     delay_line.SetDelay(smooth_delay_smp);
-    const float delay_out = delay_line.Read();
+    const float delay_out_raw = delay_line.Read();
+
+    // 4. Feedback path LPF: warms each successive repeat — one-pole at ~5 kHz.
+    //    Feeds back through the BBD-bandwidth LPF too, so long echoes get
+    //    progressively darker and thicker, exactly like the real DMM.
+    fb_lpf_z += fb_lpf_c * (delay_out_raw - fb_lpf_z);
+    const float delay_out = delay_out_raw;  // read head output (unfiltered for mix)
+
     // During freeze, fade new input to zero so delay just recirculates.
-    // freeze_blend ramps smoothly 0→1 to avoid pops.
     const float delay_input = tape_out * (1.f - freeze_blend);
-    // BBD bandwidth: LPF colours the write path, cutoff = bbd_c computed block-rate.
-    // At short times: near-transparent (9 kHz). At long times: dark (2–4 kHz).
+
+    // 5. BBD bandwidth LPF on the write path (block-rate bbd_c coefficient).
+    //    At short times: near-transparent (~9 kHz).
+    //    At long times: dark (~2 kHz) — matches real MN3005 characteristics.
     bbd_lpf_z += bbd_c * (delay_input - bbd_lpf_z);
-    delay_line.Write(bbd_lpf_z + delay_out * fb);
+    delay_line.Write(bbd_lpf_z + fb_lpf_z * fb);
+
+    // 6. Anti-image LPF after BBD (same 8 kHz Butterworth coefficients as aa).
+    //    Reconstruction filter; also rounds off any BBD clock-noise edges.
+    const float ai_out = BiquadLP(delay_out, ai_w1, ai_w2,
+                                  aa_b0, aa_b1, aa_b2, aa_a1, aa_a2);
+
+    // 7. No expander — digital has no analog noise floor to suppress.
+    //    The compressor's attack/release character is fully preserved.
+    const float expanded = ai_out;
 
     // ── Reverb + shimmer feedback loop ────────────────────────────────────────
     //
@@ -480,15 +570,26 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     //
     if (!std::isfinite(shimmer_buf)) shimmer_buf = 0.f;
 
-    // Reverb input: crossfade tape→delay (not sum!) so level stays ~unity.
-    // shimmer_buf feeds back at shimmer_amt (max 0.25).
-    const float verb_src = lerpf(tape_out, delay_out, mp.delay_send)
+    // Reverb input: crossfade tone-filtered signal → BBD-expanded output.
+    // expanded carries the full DMM delay character; tape_out is the dry tone.
+    const float verb_src = lerpf(tape_out, expanded, mp.delay_send)
                          * (1.f - freeze_blend);
     float pre_verb_l = verb_src + shimmer_buf * shimmer_amt;
 
-    // Mono-in, stereo-out reverb
+    // Gate reverb when its contribution to the mix would be inaudible.
+    // reverb_send < 0.005 → output scaling < 0.5% → silent in the mix.
+    // Skips 8-tap SDRAM scatter-gather reads every sample in Tape zone.
+    // State is NOT zeroed — residual content × 0.005 × 1.8 is inaudible,
+    // and the reverb drains naturally once the gate reopens.
     float verbL, verbR;
-    reverb.Process(pre_verb_l, pre_verb_l, &verbL, &verbR);
+    if(mp.reverb_send > 0.005f || shimmer_amt > 0.001f)
+    {
+        reverb.Process(pre_verb_l, pre_verb_l, &verbL, &verbR);
+    }
+    else
+    {
+        verbL = verbR = 0.f;
+    }
 
     // Guard against NaN (can propagate from reverb internal state)
     if (!std::isfinite(verbL)) verbL = 0.f;
@@ -526,7 +627,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // Dry path: crossfade tape→delay (same blend as reverb input).
     // Reverb blends in on top, scaled by reverb_send.
     // Total wet level stays consistent across the morph range.
-    const float dry_path = lerpf(tape_out, delay_out, mp.delay_send);
+    const float dry_path = lerpf(tape_out, expanded, mp.delay_send);
     const float dry_level = fmaxf(0.15f, 1.f - mp.reverb_send * 0.7f);
     const float wetL = dry_path * dry_level
                      + verbL   * mp.reverb_send * 1.8f;
@@ -545,6 +646,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 int main() {
   // boost=true: 480 MHz overclock — comfortable headroom at 48 kHz.
   hw.Init(true);
+  // FTZ for the main loop context (LED math etc.). The audio callback ISR
+  // sets FTZ independently on each entry because FPSCR is reset per-ISR.
+  __set_FPSCR(__get_FPSCR() | (1u << 24));  // FZ bit: flush denormals to zero
   hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
   hw.SetAudioBlockSize(48);
   const float sr = hw.AudioSampleRate();  // 48000.f
@@ -562,15 +666,24 @@ int main() {
 
   dc_block.Init(sr);
 
-  folder.Init();
-  folder.SetGain(1.f);
-  folder.SetOffset(0.f);
+  // ── DMM filter coefficients ───────────────────────────────────────────────────
+  // 2-pole Butterworth LPF at 8 kHz — shared by anti-alias and anti-image filters.
+  // Bilinear transform of analogue prototype: ωc = 2π·8000/sr, Q = 1/√2.
+  {
+    const float wc  = kTwoPi * 8000.f / sr;
+    const float q   = 0.7071f;  // Butterworth Q = 1/√2
+    const float k   = tanf(wc * 0.5f);
+    const float k2  = k * k;
+    const float norm = 1.f / (k2 + k / q + 1.f);
+    aa_b0 =  k2 * norm;
+    aa_b1 =  2.f * k2 * norm;
+    aa_b2 =  aa_b0;
+    aa_a1 =  2.f * (k2 - 1.f) * norm;
+    aa_a2 =  (k2 - k / q + 1.f) * norm;
+  }
 
-  // Tape saturator filter coefficients
-  // tape_hpf_c: one-pole LPF at 3 kHz — subtracted from input to give HPF (pre-emphasis)
-  // tape_lpf_c: one-pole LPF at 8 kHz — post-saturation head-gap rolloff
-  tape_hpf_c = expf(-kTwoPi * 3000.f / sr);
-  tape_lpf_c = 1.f - expf(-kTwoPi * 8000.f / sr);
+  // One-pole feedback LPF at 5 kHz — darkens successive delay repeats.
+  fb_lpf_c = 1.f - expf(-kTwoPi * 5000.f / sr);
 
   tone_filter.Init(sr);
   tone_filter.SetFreq(8000.f);
