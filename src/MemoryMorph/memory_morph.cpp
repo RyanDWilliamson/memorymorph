@@ -46,7 +46,6 @@ using daisysp::DcBlock;
 using daisysp::DelayLine;
 using daisysp::Oscillator;
 using daisysp::PitchShifter;
-using daisysp::ReverbSc;
 using daisysp::Svf;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -60,17 +59,51 @@ static constexpr float    kTwoPi       = 6.28318530718f;
 
 static DelayLine<float, kMaxDelaySmp> DSY_SDRAM_BSS delay_line;
 
-// ReverbSc holds aux_[98936] (~387 KB) with 8 delay taps at random offsets.
-// Random-access cache-miss pattern: placing this in AXI SRAM (RAM_D1, 512 KB)
-// costs only ~3–5 AXI cycles per miss vs ~30–60 CPU cycles for SDRAM.
-// Total BSS without DSY_SDRAM_BSS: ~279 KB — well within the 512 KB RAM_D1.
-static ReverbSc reverb;
-
 // PitchShifter holds two DelayLine<float,16384> (~128 KB total).
-// Its grain algorithm sweeps sequentially, so SDRAM burst-read latency is
-// amortised — far more cache-friendly in SDRAM than the reverb's scatter reads.
-// Only active when shimmer is on, so SDRAM pressure is limited to Ambient zone.
+// Sequential grain sweeps tolerate SDRAM burst-read latency well.
 static PitchShifter DSY_SDRAM_BSS pitch;
+
+// ── Custom plate reverb ────────────────────────────────────────────────────────
+// Schroeder-style mono-in / stereo-out plate reverb.
+// Architecture: 3-stage allpass pre-diffusion → 4 parallel damped comb filters
+// per side → 1 allpass post-diffusion per side.
+//
+// All delay lengths are mutually prime to eliminate flutter echo.
+// L and R comb lengths differ by prime offsets for stereo decorrelation.
+// No random modulation — deterministic, zero periodic artifacts.
+//
+// Total SRAM cost: ~60 KB (vs ReverbSc's 387 KB).
+
+// Pre-diffusion allpass sections (shared mono input path)
+static constexpr int kVerbApLen[3] = { 113, 162, 241 };
+static float verb_ap_buf[3][241]   = {};
+static int   verb_ap_pos[3]        = {};
+
+// Parallel comb filter delay lengths (samples at 48 kHz).
+// Lengths chosen to be mutually prime; R offset by primes from L.
+static constexpr int kVerbCombL[4] = { 1213, 1381, 1531, 1657 };
+static constexpr int kVerbCombR[4] = { 1237, 1409, 1559, 1681 };
+static float verb_comb_buf_l[4][1700] = {};
+static float verb_comb_buf_r[4][1700] = {};
+static int   verb_comb_pos_l[4]       = {};
+static int   verb_comb_pos_r[4]       = {};
+static float verb_comb_flt_l[4]       = {};  // one-pole LPF state per comb
+static float verb_comb_flt_r[4]       = {};
+
+// Post-diffusion allpass per side (different lengths for further decorrelation)
+static constexpr int kVerbPostApL = 453;
+static constexpr int kVerbPostApR = 557;
+static float verb_post_buf_l[453] = {};
+static float verb_post_buf_r[557] = {};
+static int   verb_post_pos_l      = 0;
+static int   verb_post_pos_r      = 0;
+
+// Reverb parameters — set once per block in AudioCallback
+static float verb_feedback = 0.80f;
+// verb_damp: one-pole LPF coefficient in comb feedback path.
+// Derived from lpf_hz as: damp = exp(-2π × hz / sr)
+// Large damp (→1) = dark/warm; small damp (→0) = bright/airy.
+static float verb_damp = 0.30f;
 
 // ── Other DSP objects ─────────────────────────────────────────────────────────
 
@@ -112,6 +145,11 @@ static float bbd_lpf_z = 0.f;
 // Squared-signal RMS envelope detector for the compressor (before BBD).
 // Attack ~5 ms / release ~60 ms — matches real SA571 time constants.
 static float comp_env_sq = 0.f;
+// Sidechain one-pole LP state for the compressor's 80 Hz HPF.
+// The envelope is tracked from a high-passed version of the signal so that
+// 60 Hz mains hum (strong on single-coil pickups) cannot pump the compressor.
+// Guitar tone is unaffected — the HPF only gates the detector, not the output.
+static float comp_hpf_z  = 0.f;
 
 // ── Anti-alias / anti-image 2-pole Butterworth LPF ───────────────────────────
 // Before BBD (aa): prevents aliasing. After BBD (ai): reconstruction filter.
@@ -253,18 +291,85 @@ static inline float BiquadLP(float x, float& w1, float& w2,
 static constexpr float kCompTarget    = 0.25f;    // ~–12 dBFS RMS target
 static constexpr float kCompAttack    = 0.004158f; // ~5 ms at 48 kHz  [1-exp(-1/(0.005*48000))]
 static constexpr float kCompRelease   = 0.000347f; // ~60 ms at 48 kHz [1-exp(-1/(0.060*48000))]
-static constexpr float kCompMaxGain   = 2.5f;      // punchy but not harsh at hot input
+static constexpr float kCompMaxGain   = 2.0f;      // caps gain so hum isn't over-amplified when sidechain is quiet
 static constexpr float kCompMinGain   = 0.1f;
+// Sidechain HPF coefficient: 1-pole at ~164 Hz = 1-exp(-2π×164/48000)
+// Rejects 60 Hz mains hum (and its 2nd harmonic at 120 Hz) from the envelope
+// detector without touching the audio path.
+static constexpr float kCompHpfC      = 0.02124f;
 
 static inline float DmmCompress(float x) {
-  const float x2 = x * x;
+  // Sidechain HPF: track a version of x with sub-80 Hz removed.
+  // comp_hpf_z is the one-pole LP state; subtracting it gives the HP signal.
+  comp_hpf_z += kCompHpfC * (x - comp_hpf_z);
+  const float x_sc = x - comp_hpf_z;   // sidechain: signal above ~80 Hz
+  const float x2   = x_sc * x_sc;      // detector uses sidechain squared
   if (x2 > comp_env_sq)
     comp_env_sq += kCompAttack   * (x2 - comp_env_sq);
   else
     comp_env_sq += kCompRelease  * (x2 - comp_env_sq);
   const float rms  = sqrtf(comp_env_sq + 1e-12f);
   const float gain = fmaxf(kCompMinGain, fminf(kCompMaxGain, kCompTarget / rms));
-  return tanhf(x * gain);  // tanhf here is safe — NOT in a feedback path
+  return tanhf(x * gain);  // gain applied to full signal, not sidechain
+}
+
+// ── Plate reverb DSP functions ────────────────────────────────────────────────
+
+// Set feedback (decay) coefficient — call once per block.
+static inline void VerbSetFeedback(float feedback) {
+  verb_feedback = feedback;
+}
+
+// Set high-frequency damping from a cutoff frequency in Hz — call once per block.
+// Large hz = bright (small damp); small hz = warm/dark (large damp).
+static inline void VerbSetLpFreq(float hz) {
+  verb_damp = expf(-kTwoPi * hz / static_cast<float>(kSampleRate));
+}
+
+// Allpass section: fixed coefficient g = 0.5 (Schroeder/Freeverb convention).
+// Transfer function: H(z) = (-g + z^{-D}) / (1 - g*z^{-D}), |H| = 1 for all f.
+// Correct form: write = in + g*delayed; output = delayed - g*in.
+static inline float VerbAllpass(float in, float* buf, int& pos, int len) {
+  const float bufout = buf[pos];
+  buf[pos] = in + bufout * 0.5f;
+  if (++pos >= len) pos = 0;
+  return bufout - in * 0.5f;
+}
+
+// Damped comb filter — Freeverb style.
+// One-pole LPF (coefficient verb_damp) applied to feedback signal so high
+// frequencies decay faster, giving a natural plate character.
+static inline float VerbComb(float in, float* buf, int& pos, int len,
+                              float& flt) {
+  const float out = buf[pos];
+  flt = out * (1.f - verb_damp) + flt * verb_damp;  // one-pole LPF
+  buf[pos] = in + flt * verb_feedback;
+  if (++pos >= len) pos = 0;
+  return out;
+}
+
+// Mono-in, stereo-out plate reverb — call once per sample when active.
+static void VerbProcess(float in, float* outL, float* outR) {
+  // Pre-diffuse the input through 3 allpass stages.
+  // Spreads the impulse response for smooth buildup — avoids metallic attack.
+  float sig = in;
+  sig = VerbAllpass(sig, verb_ap_buf[0], verb_ap_pos[0], kVerbApLen[0]);
+  sig = VerbAllpass(sig, verb_ap_buf[1], verb_ap_pos[1], kVerbApLen[1]);
+  sig = VerbAllpass(sig, verb_ap_buf[2], verb_ap_pos[2], kVerbApLen[2]);
+
+  // 4 parallel damped combs per side — mutually prime lengths suppress flutter.
+  // L and R use different lengths for natural stereo width without a chorus.
+  float sumL = 0.f, sumR = 0.f;
+  for(int n = 0; n < 4; ++n) {
+    sumL += VerbComb(sig, verb_comb_buf_l[n], verb_comb_pos_l[n], kVerbCombL[n],
+                     verb_comb_flt_l[n]);
+    sumR += VerbComb(sig, verb_comb_buf_r[n], verb_comb_pos_r[n], kVerbCombR[n],
+                     verb_comb_flt_r[n]);
+  }
+  // Normalise by comb count and post-diffuse each side independently.
+  // Output scale ×0.35 matches ReverbSc's kOutputGain so existing mix levels hold.
+  *outL = VerbAllpass(sumL * 0.25f, verb_post_buf_l, verb_post_pos_l, kVerbPostApL) * 0.35f;
+  *outR = VerbAllpass(sumR * 0.25f, verb_post_buf_r, verb_post_pos_r, kVerbPostApR) * 0.35f;
 }
 
 // ── Audio callback ─────────────────────────────────────────────────────────────
@@ -372,17 +477,21 @@ void AudioCallback(AudioHandle::InputBuffer  in,
   const auto sw2 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2);
   const auto sw3 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3);
 
-  // ── Bypass: block-level early return ─────────────────────────────────────────
-  // Do NOT call reverb.Process() or delay_line operations during bypass.
-  // ReverbSc::NextRandomLineseg() fires periodically (slowest: ~0.891 Hz,
-  // period ~1.12 s) and jumps its read pointer, causing a burst of SDRAM
-  // cache misses that overrun the audio DMA deadline — audible as a pulse
-  // of noise even with dry signal passing through. Early return skips all
-  // DSP and all SDRAM access for the entire block.
-  // Filter states are zeroed here so the chain starts clean on re-engage.
-  if (bypass) {
+  // ── Soft bypass ───────────────────────────────────────────────────────────────
+  // Linear ramp over ~5 ms (240 samples at 48 kHz) eliminates engage/disengage
+  // pops. 0.0 = fully bypassed, 1.0 = fully active. The early return is only
+  // taken once the ramp has fully settled at 0 — during the ramp the full DSP
+  // chain runs and the output is crossfaded toward dry.
+  static float bypass_ramp = 0.f;
+  static constexpr float kBypassRampRate = 1.f / 240.f;
+  const float bypass_target = bypass ? 0.f : 1.f;
+
+  if (bypass && bypass_ramp < 0.0001f) {
+    // Fully settled in bypass — zero filter states so re-engage starts clean,
+    // then pass dry signal through without touching any DSP or SDRAM.
     bbd_lpf_z   = 0.f;
     comp_env_sq = 0.f;
+    comp_hpf_z  = 0.f;
     aa_w1 = aa_w2 = ai_w1 = ai_w2 = fb_lpf_z = 0.f;
     shimmer_buf = 0.f;
     shimmer_env = 0.f;
@@ -447,9 +556,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
   static float smooth_verb_lpf = 8500.f;
 
   // ── Block-rate reverb + tone config ────────────────────────────────────────
-  // reverb.SetFeedback() and SetLpFreq() each recompute an expf() coefficient.
-  // smooth_morph changes < 0.01 per block — computing these once saves 47 expf()
-  // calls per block with no perceptible difference.
+  // VerbSetFeedback/VerbSetLpFreq each do one expf() — cheap, no gating needed.
   {
     const MorphParams mp_b = ComputeMorph(smooth_morph);
     const float rev_decay_b = lerpf(mp_b.reverb_decay, 0.999f, freeze_blend);
@@ -459,14 +566,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     const float shimmer_amt_b = shimmer_on ? 0.25f * mp_b.reverb_send : 0.f;
     if (shimmer_amt_b > 0.001f && !frozen_now)
       eff_decay_b = fminf(eff_decay_b, 0.93f);
-    reverb.SetFeedback(eff_decay_b);
-    // Gate SetLpFreq: ReverbSc::Process() recomputes cosf()+sqrtf() every time
-    // lpfreq changes. Only push a new value when the glide has moved > 0.5 Hz.
-    const float new_verb_lpf = smooth_verb_lpf + 0.01f * (mp_b.reverb_lpf_hz - smooth_verb_lpf);
-    if (fabsf(new_verb_lpf - smooth_verb_lpf) > 0.5f) {
-      reverb.SetLpFreq(new_verb_lpf);
-    }
-    smooth_verb_lpf = new_verb_lpf;
+    VerbSetFeedback(eff_decay_b);
+    smooth_verb_lpf += 0.01f * (mp_b.reverb_lpf_hz - smooth_verb_lpf);
+    VerbSetLpFreq(smooth_verb_lpf);
   }
 
   // tone_filter.SetFreq() recomputes SVF coefficients. Advance smooth_tone and
@@ -483,6 +585,12 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     smooth_repeats += kSmooth * (repeats   - smooth_repeats);
     const float morph = smooth_morph;
     const float mix   = smooth_mix;
+
+    // Advance bypass ramp (linear, 5 ms)
+    if (bypass_ramp < bypass_target)
+      bypass_ramp = fminf(bypass_ramp + kBypassRampRate, bypass_target);
+    else if (bypass_ramp > bypass_target)
+      bypass_ramp = fmaxf(bypass_ramp - kBypassRampRate, bypass_target);
 
     // fb per-sample: eliminates ADC jitter on KNOB_3 creating a 1 kHz AM tone.
     const float fb = lerpf(smooth_repeats, 0.999f, freeze_blend);
@@ -578,13 +686,10 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
     // Gate reverb when its contribution to the mix would be inaudible.
     // reverb_send < 0.005 → output scaling < 0.5% → silent in the mix.
-    // Skips 8-tap SDRAM scatter-gather reads every sample in Tape zone.
-    // State is NOT zeroed — residual content × 0.005 × 1.8 is inaudible,
-    // and the reverb drains naturally once the gate reopens.
     float verbL, verbR;
     if(mp.reverb_send > 0.005f || shimmer_amt > 0.001f)
     {
-        reverb.Process(pre_verb_l, pre_verb_l, &verbL, &verbR);
+        VerbProcess(pre_verb_l, &verbL, &verbR);
     }
     else
     {
@@ -636,8 +741,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
     // Single tanhf at the output — NOT in a feedback loop, so no
     // waveform flattening. Just smooth, warm analog-style limiting.
-    out[0][i] = lerpf(dry, tanhf(wetL), mix);
-    out[1][i] = lerpf(dry, tanhf(wetR), mix);
+    out[0][i] = lerpf(dry, tanhf(wetL), mix * bypass_ramp);
+    out[1][i] = lerpf(dry, tanhf(wetR), mix * bypass_ramp);
   }
 }
 
@@ -696,9 +801,9 @@ int main() {
   mod_lfo.SetFreq(1.f);
   mod_lfo.SetAmp(0.5f);
 
-  reverb.Init(sr);
-  reverb.SetFeedback(0.80f);
-  reverb.SetLpFreq(8000.f);
+  VerbSetFeedback(0.80f);
+  VerbSetLpFreq(8000.f);
+  // (No Init needed — verb_* buffers are static and zero-initialised by BSS.)
 
   // Shimmer: octave up. PitchShifter takes integer semitone values.
   // TODO: consider a perfect 5th (+7) option selectable via Depth knob range
