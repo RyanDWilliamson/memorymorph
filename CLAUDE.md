@@ -9,18 +9,24 @@ technical context. The summary below is Claude-specific guidance.
    before referencing them — do not guess.
 2. Read `src/MemoryMorph/memory_morph.cpp` in full before editing — many
    parameters are interdependent through the MORPH lerp system.
-3. Check `DaisySP/Source/` for the exact class/method names of any DaisySP
+3. Also read the relevant header(s): `morph.h`, `plate_reverb.h`, `dmm_chain.h`.
+   DSP logic has been extracted into these — edit them, not just the .cpp.
+4. Check `DaisySP/Source/` for the exact class/method names of any DaisySP
    module you add. Spellings that look right may be wrong (e.g. `Wavefolder`
    not `WaveFolder`).
 
 ## Absolute rules
 
-- Every `DelayLine` or `ReverbSc` declaration **must** have `DSY_SDRAM_BSS`.
+- `DelayLine` and `PitchShifter` **must** have `DSY_SDRAM_BSS`. `PlateReverb` and
+  `DmmChain` are custom structs in SRAM — do **not** add `DSY_SDRAM_BSS` to them.
 - `hw.Init(true)` — the `true` (boost mode) is mandatory.
-- Sample rate is `SAI_96KHZ`, block size is `48`. Do not change either.
+- Sample rate is `SAI_48KHZ`, block size is `48`. Do not change either.
 - `hw.ProcessAllControls()` is always the first line of `AudioCallback`.
 - No heap allocation (`new`, `malloc`) anywhere in the file.
 - LED updates belong in `while(true)`, not the audio callback.
+- `tanhf` is **prohibited in the shimmer/reverb recirculation loop** — flattens waveforms,
+  PitchShifter grain crossfades cancel, shimmer cuts out. Permitted: final output mix,
+  `dmm.Compress()`, and the delay feedback write path. See AGENTS.md §6 for full rationale.
 
 ## MORPH anchor points are sacred
 
@@ -37,7 +43,7 @@ values.
 | State variable filter | `daisysp::Svf` |
 | Overdrive / soft clip | `daisysp::Overdrive` |
 | Pitch shifter | `daisysp::PitchShifter` |
-| Reverb | `daisysp::ReverbSc` |
+| Reverb | custom `PlateReverb` struct in `plate_reverb.h` (NOT `daisysp::ReverbSc`) |
 | DC blocker | `daisysp::DcBlock` |
 | LFO oscillator | `daisysp::Oscillator` |
 

@@ -27,22 +27,32 @@ git submodule update --init --recursive
 ## Repository layout
 
 ```
-src/hothouse.h / hothouse.cpp    — HotHouse board support (do NOT modify)
-src/MemoryMorph/memory_morph.cpp — all DSP and control logic (~700 lines)
-DaisySP/                          — git submodule (do NOT modify)
-libDaisy/                         — git submodule (do NOT modify)
+src/hothouse.h / hothouse.cpp      — HotHouse board support (do NOT modify)
+src/MemoryMorph/memory_morph.cpp   — top-level DSP + control logic
+src/MemoryMorph/morph.h            — MorphParams struct + ComputeMorph() interpolation
+src/MemoryMorph/plate_reverb.h     — PlateReverb struct (Schroeder mono-in/stereo-out)
+src/MemoryMorph/dmm_chain.h        — DmmChain struct (SA571 compander + BBD/biquad filters)
+src/MemoryMorph/tap_tempo.h        — TapTempoState struct (FS1 tap/freeze state machine)
+src/MemoryMorph/shimmer.h          — ShimmerVoice struct (HPF + PitchShifter + auto-duck)
+DaisySP/                            — git submodule (do NOT modify)
+libDaisy/                           — git submodule (do NOT modify)
 ```
 
 ## Non-negotiable constraints
 
 ### 1. SDRAM placement for large buffers
 ```cpp
-// CORRECT
-static DelayLine<float, 192000> DSY_SDRAM_BSS delay_line;
-static ReverbSc                 DSY_SDRAM_BSS reverb;
+// CORRECT — DelayLine and PitchShifter must be in SDRAM
+static DelayLine<float, 96000> DSY_SDRAM_BSS delay_line;
+static PitchShifter            DSY_SDRAM_BSS pitch;
 
 // WRONG — hard fault at init
-static DelayLine<float, 192000> delay_line;
+static DelayLine<float, 96000> delay_line;
+
+// PlateReverb (~60 KB) fits in SRAM — no DSY_SDRAM_BSS needed
+static PlateReverb reverb;  // BSS zero-initialises all buffers
+// NOTE: DSY_SDRAM_BSS cannot be applied to struct members,
+// so custom structs always live in SRAM regardless of size.
 ```
 
 ### 2. Boost mode + sample rate (mandatory for this chain)
@@ -65,11 +75,16 @@ rate-limited to 1 kHz via `System::GetNow()`.
 Its internal buffer is hardcoded for 48 kHz operation but the API is fragile.
 Use `DelayLine + Oscillator` LFO instead — already implemented.
 
-### 6. No tanhf inside any feedback loop
-`tanhf` in a feedback path (reverb shimmer loop, delay feedback) progressively
-flattens waveforms → `PitchShifter` grain crossfades cancel → shimmer cuts out.
-`tanhf` is only permitted at the **final output mix** and inside `DmmCompress`
-(which is not in a feedback path).
+### 6. No tanhf in the shimmer feedback loop
+`tanhf` in the **shimmer/reverb feedback path** (reverb → PitchShifter → back to reverb)
+progressively flattens waveforms → grain crossfades cancel → shimmer cuts out.
+
+`tanhf` IS intentionally used in the **delay feedback path** (mild 2× overdrive on the
+recycled signal only) to model BBD input op-amp clipping — this is safe because the
+reverb's allpass diffusion scrambles the waveform before it reaches the PitchShifter.
+
+Permitted locations: final output mix, `dmm.Compress()`, delay feedback write path.
+Prohibited: shimmer/reverb recirculation loop.
 
 ## DMM signal chain (current implementation)
 
@@ -78,17 +93,20 @@ Per-sample path inside `AudioCallback`:
 ```
 guitar in
   → dc_block
-  → tanhf(sig × preamp_gain)        — op-amp preamp clip
-  → DmmCompress() × post_gain        — SA571 RMS 2:1 compressor
-  → BiquadLP(8 kHz Butterworth)      — anti-alias before BBD
-  → tone_filter (user Tone knob)
-  → bbd_lpf_z (bandwidth narrows with longer delay time)
-  → delay_line.Write( + fb_lpf_z×fb) — fb_lpf_z: 5 kHz feedback warmth LPF
-  → delay_line.Read()
-  → BiquadLP(same 8 kHz coeff)       — anti-image reconstruction
-  → DmmExpand()                       — SA571 complementary expander
-  → reverb / shimmer mix
-  → tanhf() on final output only
+  → tanhf(sig × preamp_gain)                    — op-amp preamp clip
+  → dmm.Compress() × post_gain                   — SA571 RMS 2:1 compressor (sidechain HPF at 164 Hz)
+  → dmm.AaFilter()                               — 8 kHz Butterworth anti-alias before BBD
+  → tone_filter (user Tone knob, 4000–18000 Hz)
+  → dmm.BbdFilter(c)                             — one-pole bandwidth LPF (narrows with delay time)
+  → fb_out = dmm.FbFilter(delay_line.Read())     — 5 kHz feedback warmth LPF
+  → fb_sat = tanhf(fb_out × fb × 2) × 0.5       — feedback soft-clip (BBD input op-amp model)
+  → delay_line.Write(BbdFilter(input) + fb_sat)
+  → delay_line.Read() → dmm.AiFilter()           — 8 kHz Butterworth anti-image reconstruction
+  → (no expander — digital has no noise floor)
+  → reverb.Process()
+      shimmer path: HPF(800 Hz) → PitchShifter(+12 st, fun=0.3) → × shimmer_amt → reverb input
+  → tanhf(verbL) × reverb_send × 2.0            — reverb pre-clip before output mix
+  → tanhf() on final output mix
 ```
 
 ## DMM drive levels (SW1)
@@ -96,11 +114,15 @@ guitar in
 All three positions use the **same compander model** — only gain differs.
 Guitar volume directly controls saturation depth within each mode.
 
+All three `post_gain` values are equal — the SA571 compressor targets the same 0.25 RMS
+output in every mode, so equal `post_gain` gives matched perceived loudness. The modes
+differ in dynamics and harmonic character, not in volume.
+
 | SW1 | Mode | `preamp_gain` | `post_gain` | Character |
 |---|---|---|---|---|
-| UP | High | 5.0× | 0.60× | Heavy compressor pumping, rich harmonics |
-| MID | Med | 2.5× | 0.90× | Nominal DMM operating point |
-| DOWN | Low | 1.2× | 1.15× | Gentle, most transparent |
+| UP | High | 5.0× | 0.80× | Heavy compressor pumping, rich harmonics |
+| MID | Med | 2.5× | 0.80× | Nominal DMM operating point |
+| DOWN | Low | 1.2× | 0.80× | Gentle, most transparent |
 
 ## SA571 compander time constants (48 kHz)
 
@@ -113,25 +135,26 @@ producing hard clipping → square-wave harmonics → audible 1–3 kHz drone.
 // Release ~60 ms: 1 - exp(-1 / (0.060 * 48000)) = 0.000347
 static constexpr float kCompAttack  = 0.004158f;
 static constexpr float kCompRelease = 0.000347f;
+
+// kCompMaxGain is capped at 2.0 — higher values cause audible digital whine
+// when the sidechain HPF removes low-frequency content from the envelope.
+static constexpr float kCompMaxGain = 2.0f;
+
+// Sidechain HPF at ~164 Hz (one-pole, kCompHpfC = 0.02124) prevents 60 Hz hum
+// from driving compressor gain upward and causing audible pumping.
+static constexpr float kCompHpfC    = 0.02124f;
 ```
 
 Expander uses the same time constants as the compressor (matched pair).
 
 ## Biquad LPF coefficients (Butterworth, 8 kHz)
 
-Computed in `main()` via bilinear transform, stored in globals `aa_b0..aa_a2`.
-The **same coefficient set** is reused for both the anti-alias and anti-image
-filters (they share the same cutoff and Q). State variables are separate:
-`aa_w1/aa_w2` (pre-BBD) and `ai_w1/ai_w2` (post-BBD).
+Encapsulated in `DmmChain::Init(float sr)` — no longer global variables.
+The same bilinear-transform coefficients are reused for both the anti-alias
+(`dmm.AaFilter()`) and anti-image (`dmm.AiFilter()`) filters. State is separate.
 
-```cpp
-const float k    = tanf(kTwoPi * 8000.f / sr * 0.5f);
-const float k2   = k * k;
-const float norm = 1.f / (k2 + k / 0.7071f + 1.f);
-aa_b0 = k2 * norm;  aa_b1 = 2.f * aa_b0;  aa_b2 = aa_b0;
-aa_a1 = 2.f * (k2 - 1.f) * norm;
-aa_a2 = (k2 - k / 0.7071f + 1.f) * norm;
-```
+Call `dmm.Init(sr)` once in `main()` before starting audio. `dmm.Reset()` zeroes
+all filter state; call it on bypass entry/exit to silence transients.
 
 ## MORPH three-zone design (preserve these anchor values)
 
@@ -152,7 +175,7 @@ controlled by SW1 (drive level), not morphed by the knob.
 | Knob 2 | `KNOB_2` | Delay time (log, 50 ms–2000 ms) |
 | Knob 3 | `KNOB_3` | Feedback (0–0.97) |
 | Knob 4 | `KNOB_4` | Mod depth (scaled by MORPH) |
-| Knob 5 | `KNOB_5` | Tone LPF (log, 1200 Hz–18 kHz) |
+| Knob 5 | `KNOB_5` | Tone LPF (log, 4000 Hz–18 kHz) |
 | Knob 6 | `KNOB_6` | Dry/wet mix |
 | Toggle 1 | `TOGGLESWITCH_1` | Drive: UP=High / MID=Med / DOWN=Low |
 | Toggle 2 | `TOGGLESWITCH_2` | Mod type: UP=Chorus / MID=Vibrato / DOWN=Wow |

@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "stdin=$(cat); f=$(echo \"$stdin\" | jq -r '.tool_input.file_path // empty'); echo \"$f\" | grep -qE 'src/MemoryMorph/.*\\.(cpp|h)$' || exit 0; make -C /home/rdw/Developer/hothouse/src/MemoryMorph > /tmp/mm_build.txt 2>&1; rc=$?; out=$(tail -20 /tmp/mm_build.txt); rm -f /tmp/mm_build.txt; [ $rc -eq 0 ] && exit 0; jq -n --arg o \"$out\" '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":(\"Build failed:\\n\" + $o)}}'",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

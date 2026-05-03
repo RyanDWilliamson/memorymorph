@@ -29,11 +29,15 @@ external SDRAM. Failure to do this causes hard faults at init.
 
 ```cpp
 // CORRECT
-static DelayLine<float, 192000> DSY_SDRAM_BSS delay_line;
-static ReverbSc                 DSY_SDRAM_BSS reverb;
+static DelayLine<float, 96000> DSY_SDRAM_BSS delay_line;
+static PitchShifter            DSY_SDRAM_BSS pitch;
 
 // WRONG — will hard fault
-static DelayLine<float, 192000> delay_line;
+static DelayLine<float, 96000> delay_line;
+
+// PlateReverb (~60 KB) fits in SRAM — no DSY_SDRAM_BSS needed
+static PlateReverb reverb;  // BSS zero-initialises all buffers
+// DSY_SDRAM_BSS cannot be applied to struct members — custom structs live in SRAM.
 ```
 
 ### Boost mode and sample rate
@@ -56,15 +60,18 @@ not from the audio callback. Rate-limit to ~1 kHz using `System::GetNow()`.
 ### No tanhf inside feedback loops
 `tanhf` in a feedback path progressively flattens waveforms → `PitchShifter`
 grain crossfades cancel → shimmer cuts out. `tanhf` is only permitted at the
-**final output mix** and inside `DmmCompress` (not a feedback path).
+**final output mix** and inside `dmm.Compress()` (not a feedback path).
 
 ## Project layout
 
 ```
-src/hothouse.h / hothouse.cpp    — HotHouse hardware proxy (do not modify)
-src/MemoryMorph/memory_morph.cpp — all DSP + control logic
-DaisySP/                          — git submodule, do not modify
-libDaisy/                         — git submodule, do not modify
+src/hothouse.h / hothouse.cpp      — HotHouse hardware proxy (do not modify)
+src/MemoryMorph/memory_morph.cpp   — top-level DSP + control logic (~700 lines)
+src/MemoryMorph/morph.h            — MorphParams struct + ComputeMorph() interpolation
+src/MemoryMorph/plate_reverb.h     — PlateReverb struct (Schroeder mono-in/stereo-out)
+src/MemoryMorph/dmm_chain.h        — DmmChain struct (SA571 compander + BBD/biquad filters)
+DaisySP/                            — git submodule, do not modify
+libDaisy/                           — git submodule, do not modify
 ```
 
 ## Hardware API quick reference
@@ -106,11 +113,16 @@ clipping → square-wave harmonics → audible 1–3 kHz drone.
 // CORRECT — compute as 1 - exp(-1 / (τ_seconds × sample_rate))
 static constexpr float kCompAttack  = 0.004158f; // 5 ms  at 48 kHz
 static constexpr float kCompRelease = 0.000347f; // 60 ms at 48 kHz
+
+// kCompMaxGain capped at 2.0 — higher causes digital whine via sidechain HPF
+static constexpr float kCompMaxGain = 2.0f;
+// Sidechain HPF at ~164 Hz prevents 60 Hz hum from pumping compressor gain
+static constexpr float kCompHpfC    = 0.02124f;
 ```
 
 ## Footswitch behavior
 
-- `FOOTSWITCH_2` single press → toggle bypass
+- `FOOTSWITCH_2` single press → toggle bypass (5 ms linear ramp to eliminate pop)
 - `FOOTSWITCH_1` short press → tap tempo
 - `FOOTSWITCH_1` hold ≥ 1500 ms → momentary freeze (release to exit)
 
@@ -118,6 +130,5 @@ static constexpr float kCompRelease = 0.000347f; // 60 ms at 48 kHz
 
 This chain at 48 kHz / 480 MHz runs comfortably within budget. Do **not**
 add additional heavy effects (FFT pitch shifters, multiple reverbs, loopers)
-without profiling first. `PitchShifter` (shimmer) is the most expensive element.
 without profiling first. The `PitchShifter` shimmer path is the most expensive
 single element.
