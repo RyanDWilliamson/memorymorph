@@ -53,6 +53,7 @@
 
 #include "daisysp.h"
 #include "hothouse.h"
+#include "constants.h"
 #include "morph.h"
 #include "plate_reverb.h"
 #include "dmm_chain.h"
@@ -79,7 +80,7 @@ using daisysp::Svf;
 
 static constexpr uint32_t kSampleRate  = 48000;
 static constexpr uint32_t kMaxDelaySmp = kSampleRate * 2;  // 2 seconds
-static constexpr float    kTwoPi       = 6.28318530718f;
+// kTwoPi now lives in constants.h (shared with the DSP headers).
 
 // ── Large DSP buffers — MUST live in 64 MB external SDRAM ─────────────────────
 // Omitting DSY_SDRAM_BSS causes a hard fault at Init().
@@ -191,6 +192,44 @@ static float smooth_delay_smp = 2400.f;  // ~50 ms default
 // Smoothed freeze blend (0=normal, 1=frozen) — ramps over ~10 ms to avoid pops
 static float freeze_blend = 0.f;
 
+// ── Bypass ramp + shared smoothing constants ─────────────────────────────────
+// Linear ramp over ~5 ms (240 samples at 48 kHz) eliminates engage/disengage
+// pops. 0.0 = fully bypassed, 1.0 = fully active. File-scope so DmmBlock and
+// Sdd555Block (extracted from AudioCallback) can both advance it.
+static float bypass_ramp = 0.f;
+static constexpr float kBypassRampRate = 1.f / 240.f;
+// Per-sample smoothing coefficient (~5 ms time constant at 48 kHz).
+static constexpr float kSmooth = 0.0002f;
+
+// ── BlockInputs ──────────────────────────────────────────────────────────────
+// Shared parameter snapshot AudioCallback reads once per block and hands to
+// the active mode's block function. DMM uses every field; SDD-555 uses only
+// what its own dispatch needs (mix_raw, freeze info, toggle positions) and
+// reads its remaining knobs via hw.GetKnobValue() since they map differently.
+struct BlockInputs {
+  float morph_raw;
+  float time_s;       // already block-rate smoothed
+  float repeats;
+  float depth;
+  float tone_hz;
+  float mix_raw;
+  float freeze_blend;
+  bool  frozen_now;
+  Hothouse::ToggleswitchPosition sw1, sw2, sw3;
+};
+
+// Forward declarations — definitions live after AudioCallback for readability.
+static void DmmBlock   (AudioHandle::InputBuffer  in,
+                         AudioHandle::OutputBuffer out,
+                         size_t                    size,
+                         const BlockInputs&        p,
+                         float                     bypass_target);
+static void Sdd555Block(AudioHandle::InputBuffer  in,
+                         AudioHandle::OutputBuffer out,
+                         size_t                    size,
+                         const BlockInputs&        p,
+                         float                     bypass_target);
+
 // ── Footswitch callbacks ───────────────────────────────────────────────────────
 
 static void OnNormalPress(Hothouse::Switches fsw) {
@@ -220,68 +259,36 @@ void AudioCallback(AudioHandle::InputBuffer  in,
   // ── FS1: short press = tap tempo; hold ≥ 1500 ms = momentary freeze ─────────
   tap.Update(hw.switches[Hothouse::FOOTSWITCH_1].Pressed(), System::GetNow());
 
-  // ── Read all parameters once per block ──────────────────────────────────────
-
-  const float morph_raw  = p_morph.Process();
-  const float knob_time  = p_time.Process();      // seconds
-  const float repeats    = p_repeats.Process();   // 0 – 0.97
-
-  // Tap tempo: use tapped interval if active; turning the knob overrides
+  // ── Snapshot all per-block inputs into `p` ──────────────────────────────────
+  BlockInputs p;
+  p.morph_raw           = p_morph.Process();
+  const float knob_time  = p_time.Process();              // seconds (DMM-mapped)
+  p.repeats             = p_repeats.Process();
   const float time_target = tap.GetTimeS(knob_time);
-  const float depth   = p_depth.Process();     // 0 – 1
-  const float tone_hz = p_tone.Process();      // Hz
-  const float mix_raw = p_mix.Process();       // 0 – 1
+  p.depth               = p_depth.Process();
+  p.tone_hz             = p_tone.Process();
+  p.mix_raw             = p_mix.Process();
 
-  // Per-sample smoothing targets — actual smoothing happens inside the DSP loop
-  // to avoid the 1 kHz staircase whine that block-rate smoothing produces.
-  static float smooth_morph   = 0.f;
-  static float smooth_mix     = 0.5f;
-  static float smooth_time    = 0.3f;
-  static float smooth_tone    = 4000.f;
-  // smooth_repeats: ADC output on KNOB_3 has 1–2 LSB of jitter even when still.
-  // That jitter ± one step per block AM-modulates the delay feedback at 1 kHz,
-  // producing a quiet but audible standing tone at hot input levels with any
-  // feedback. Per-sample smoothing eliminates the jitter; lag is imperceptible.
-  static float smooth_repeats = 0.f;
+  // Block-rate glide for delay time (tap-tempo slide). Used by DmmBlock;
+  // Sdd555Block has its own knob mapping for echo time (50–500 ms log).
+  static float smooth_time = 0.3f;
+  smooth_time += 0.01f * (time_target - smooth_time);
+  p.time_s = smooth_time;
 
-  // Block-rate glide for delay time (tap tempo slide — slow enough to
-  // avoid audible doppler chirp when the read head moves)
-  smooth_time  += 0.01f * (time_target - smooth_time);
-  const float time_s = smooth_time;
-
-  // Block-rate glide for LFO amplitude — without this, turning KNOB_4
-  // causes LFO amplitude to step at 1 kHz, producing audible clicks.
-  static float smooth_depth = 0.f;
-  smooth_depth += 0.02f * (depth - smooth_depth);
-
-  // Freeze ramp: asymmetric rates so engage feels immediate and release is clean.
-  // Engage 0.015 → τ≈67 ms (snaps in within ~100 ms of the 1500 ms gate opening).
-  // Release 0.03 → τ≈33 ms (back to live within ~50 ms of button lift, no ghost-loop).
+  // Freeze ramp: asymmetric — engage 0.015 (τ≈67 ms) / release 0.03 (τ≈33 ms).
   const float freeze_target = tap.IsFreeze() ? 1.f : 0.f;
   const float freeze_rate   = (freeze_target > freeze_blend) ? 0.015f : 0.03f;
   freeze_blend += freeze_rate * (freeze_target - freeze_blend);
-  const bool frozen_now = freeze_blend > 0.5f;
+  p.freeze_blend = freeze_blend;
+  p.frozen_now   = freeze_blend > 0.5f;
 
-  // NOTE: fb is computed per-sample inside the loop using smooth_repeats.
+  p.sw1 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_1);
+  p.sw2 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2);
+  p.sw3 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3);
 
-  // ── Toggle positions ─────────────────────────────────────────────────────────
-
-  const auto sw1 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_1);
-  const auto sw2 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2);
-  const auto sw3 = hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3);
-
-  // ── Soft bypass ───────────────────────────────────────────────────────────────
-  // Linear ramp over ~5 ms (240 samples at 48 kHz) eliminates engage/disengage
-  // pops. 0.0 = fully bypassed, 1.0 = fully active. The early return is only
-  // taken once the ramp has fully settled at 0 — during the ramp the full DSP
-  // chain runs and the output is crossfaded toward dry.
-  static float bypass_ramp = 0.f;
-  static constexpr float kBypassRampRate = 1.f / 240.f;
+  // ── Soft bypass settled early-return ────────────────────────────────────────
   const float bypass_target = bypass ? 0.f : 1.f;
-
   if (bypass && bypass_ramp < 0.0001f) {
-    // Fully settled in bypass — zero the active mode's filter states so
-    // re-engage starts clean, then pass dry signal through.
     if (active_mode == ActiveMode::DMM) {
       dmm.Reset();
       shimmer.Reset();
@@ -302,13 +309,21 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     return;
   }
 
-  // Per-sample smoothing coefficient (~5 ms time constant at 48 kHz).
-  // Used by both modes' per-sample mix/parameter smoothing.
-  static constexpr float kSmooth = 0.0002f;
+  // ── Mode dispatch ───────────────────────────────────────────────────────────
+  if (active_mode == ActiveMode::SDD555)
+    Sdd555Block(in, out, size, p, bypass_target);
+  else
+    DmmBlock   (in, out, size, p, bypass_target);
+}
 
-  // ── SDD-555 mode — Phase 7: drive → compress → chorus → expand →            ──
-  //                            MechAge → SW3 verb (MORPH-scaled) → mix          ──
-  if (active_mode == ActiveMode::SDD555) {
+// ── Sdd555Block ──────────────────────────────────────────────────────────────
+// SDD-555 mode per-sample loop. See AGENTS.md "SDD-555 signal chain" for the
+// full path: drive → compress → tape echo → chorus → expand → MechAge → verb.
+static void Sdd555Block(AudioHandle::InputBuffer  in,
+                         AudioHandle::OutputBuffer out,
+                         size_t                    size,
+                         const BlockInputs&        p,
+                         float                     bypass_target) {
     // SW1 input drive — LINEAR gain into the NE570 (no preamp clip).
     // The real SRE-555 input was a clean JRC4558 op-amp buffer with ~24× headroom
     // at guitar levels; it didn't clip. All program-dependent dirt comes from
@@ -316,9 +331,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // Higher drive just pushes the NE570 harder — more polynomial coloration and
     // more compressor pumping, never square-wave saturation.
     float sdd_drive;
-    if      (sw1 == Hothouse::TOGGLESWITCH_UP)     sdd_drive = 2.0f;  // Hot
-    else if (sw1 == Hothouse::TOGGLESWITCH_MIDDLE) sdd_drive = 1.0f;  // Warm
-    else                                            sdd_drive = 0.5f;  // Clean
+    if      (p.sw1 == Hothouse::TOGGLESWITCH_UP)     sdd_drive = 2.0f;  // Hot
+    else if (p.sw1 == Hothouse::TOGGLESWITCH_MIDDLE) sdd_drive = 1.0f;  // Warm
+    else                                              sdd_drive = 0.5f;  // Clean
 
     // Raw knob reads — SDD-555 mappings differ from DMM, so bypass Parameter::Process.
     // KNOB_2 has its own log curve here (50–500 ms — authentic SRE-555 range)
@@ -358,8 +373,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     delay_line.SetDelay(sdd_smooth_echo_smp);
 
     // Feedback path LPF coefficient — tape darkens repeats at ~6 kHz cutoff.
-    const float sdd_fb_lpf_c = 1.f - expf(-kTwoPi * 6000.f
-                                          / static_cast<float>(kSampleRate));
+    const float sdd_fb_lpf_c = OnePoleCoeff(6000.f, static_cast<float>(kSampleRate));
 
     // Chorus rate is no longer directly knob-controlled in SDD-555 mode (KNOB_2
     // is now echo time). Fixed at 0.6 Hz — a musical default for slow chorus.
@@ -380,14 +394,14 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     const float mech_lfo     = sinf(mech_wow_phase * kTwoPi);
     const float mech_base_hz = lerpf(18000.f, 4000.f, mech_age_knob);
     const float mech_hz      = mech_base_hz * (1.f + mech_lfo * mech_age_knob * 0.2f);
-    const float mech_c       = 1.f - expf(-kTwoPi * mech_hz / static_cast<float>(kSampleRate));
+    const float mech_c       = OnePoleCoeff(mech_hz, static_cast<float>(kSampleRate));
 
     static float sdd_smooth_mix = 0.f;
 
     for (size_t i = 0; i < size; ++i) {
       const float dry = in[0][i];
 
-      sdd_smooth_mix += kSmooth * (mix_raw - sdd_smooth_mix);
+      sdd_smooth_mix += kSmooth * (p.mix_raw - sdd_smooth_mix);
       const float mix = sdd_smooth_mix;
 
       if (bypass_ramp < bypass_target)
@@ -414,9 +428,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
       // Chorus algorithm (SW2). Branch on block-rate constant — predictor handles cleanly.
       float wetL, wetR;
-      if      (sw2 == Hothouse::TOGGLESWITCH_UP)     chorus.ProcessBbd       (sig, wetL, wetR);
-      else if (sw2 == Hothouse::TOGGLESWITCH_MIDDLE) chorus.ProcessEventide  (sig, wetL, wetR);
-      else                                            chorus.ProcessDimensionD(sig, wetL, wetR);
+      if      (p.sw2 == Hothouse::TOGGLESWITCH_UP)     chorus.ProcessBbd       (sig, wetL, wetR);
+      else if (p.sw2 == Hothouse::TOGGLESWITCH_MIDDLE) chorus.ProcessEventide  (sig, wetL, wetR);
+      else                                              chorus.ProcessDimensionD(sig, wetL, wetR);
 
       // Matched stereo expanders.
       const float exp_l = ne570_exp_l.Expand(wetL);
@@ -431,9 +445,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
       // SW3 verb selection. Only one runs per sample; the others' state holds.
       const float verb_in = 0.5f * (aged_l + aged_r);
       float verb_l = 0.f, verb_r = 0.f;
-      if      (sw3 == Hothouse::TOGGLESWITCH_UP)     nl_verb.ProcessAms     (verb_in, verb_l, verb_r);
-      else if (sw3 == Hothouse::TOGGLESWITCH_MIDDLE) nl_verb.ProcessWildcard(verb_in, verb_l, verb_r);
-      else                                            spring  .Process       (verb_in, verb_l, verb_r);
+      if      (p.sw3 == Hothouse::TOGGLESWITCH_UP)     nl_verb.ProcessAms     (verb_in, verb_l, verb_r);
+      else if (p.sw3 == Hothouse::TOGGLESWITCH_MIDDLE) nl_verb.ProcessWildcard(verb_in, verb_l, verb_r);
+      else                                              spring  .Process       (verb_in, verb_l, verb_r);
 
       // MORPH-scaled verb send — at morph=0 the chorus path is dry, at
       // morph=1 the verb is at full return level.
@@ -446,230 +460,147 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     return;
   }
 
-  // ── Update DSP module parameters ─────────────────────────────────────────────
-
-  // DMM drive level from SW1.
-  // preamp_gain: scales the guitar signal before the compressor.
-  // post_gain: compensates output level so all three positions match at
-  //   nominal guitar volume (~0.2–0.3 peak). Guitar volume controls saturation
-  //   depth within each mode — turn up for more harmonic content.
+// ── DmmBlock ─────────────────────────────────────────────────────────────────
+// DMM mode per-sample loop. See AGENTS.md "DMM signal chain" for the full path:
+// drive → tanhf preamp (NJM4558 model) → SA571 compress → AA filter → tone →
+// BBD delay with feedback soft-clip → AI filter → reverb + shimmer feedback loop.
+static void DmmBlock(AudioHandle::InputBuffer  in,
+                     AudioHandle::OutputBuffer out,
+                     size_t                    size,
+                     const BlockInputs&        p,
+                     float                     bypass_target) {
+  // SW1 drive — preamp_gain feeds tanhf clip then SA571 compress; post_gain
+  // compensates output level. High runs intentionally hotter than Med/Low.
   float preamp_gain, post_gain;
-  // post_gain is set equal across modes — the SA571 compressor targets 0.25 RMS
-  // output in all three modes, so post_gain is the only level control.
-  // High mode runs intentionally hotter than Med/Low — post_gain is higher to
-  // reflect the extra drive character. Med and Low remain level-matched to each other.
-  if (sw1 == Hothouse::TOGGLESWITCH_UP) {
-    // High: very hard preamp clip, aggressive compressor pumping, maximum harmonic content
-    preamp_gain = 12.0f;  post_gain = 1.0f;
-  } else if (sw1 == Hothouse::TOGGLESWITCH_MIDDLE) {
-    // Med: noticeable saturation and compression snap
-    preamp_gain = 4.0f;  post_gain = 0.80f;
-  } else {
-    // Low: gentle grit, most transparent; guitar vol drives saturation depth
-    preamp_gain = 2.0f;  post_gain = 0.80f;
-  }
+  if      (p.sw1 == Hothouse::TOGGLESWITCH_UP)     { preamp_gain = 12.0f; post_gain = 1.0f;  }
+  else if (p.sw1 == Hothouse::TOGGLESWITCH_MIDDLE) { preamp_gain = 4.0f;  post_gain = 0.80f; }
+  else                                              { preamp_gain = 2.0f;  post_gain = 0.80f; }
 
-  // Tone filter res is constant
   tone_filter.SetRes(0.f);
 
-  // Shimmer and decay targets — applied per-sample with smoothed morph
-  const bool shimmer_on = (sw3 == Hothouse::TOGGLESWITCH_DOWN);
-  const bool short_plate = (sw3 == Hothouse::TOGGLESWITCH_UP);
+  const bool shimmer_on  = (p.sw3 == Hothouse::TOGGLESWITCH_DOWN);
+  const bool short_plate = (p.sw3 == Hothouse::TOGGLESWITCH_UP);
 
-  // LFO rate depends on modulation type (sw2) and depth knob
+  // LFO rate depends on SW2 mod type and depth knob.
   float lfo_hz;
-  if      (sw2 == Hothouse::TOGGLESWITCH_UP)     lfo_hz = 0.5f + depth * 4.5f;  // Chorus:     0.5–5 Hz
-  else if (sw2 == Hothouse::TOGGLESWITCH_MIDDLE)  lfo_hz = 1.5f + depth * 6.5f;  // Vibrato:    1.5–8 Hz
-  else                                             lfo_hz = 0.1f + depth * 1.4f;  // Wow/Flutter: 0.1–1.5 Hz
-
+  if      (p.sw2 == Hothouse::TOGGLESWITCH_UP)     lfo_hz = 0.5f + p.depth * 4.5f;
+  else if (p.sw2 == Hothouse::TOGGLESWITCH_MIDDLE) lfo_hz = 1.5f + p.depth * 6.5f;
+  else                                              lfo_hz = 0.1f + p.depth * 1.4f;
   mod_lfo.SetFreq(lfo_hz);
-  // Depth is scaled by MORPH so at Tape anchor (morph=0) there is no modulation
-  // Use current smooth_morph for block-rate LFO amplitude (doesn't need per-sample)
+
+  // ── DMM-only smoothing state — static locals persist across calls ──────────
+  static float smooth_morph    = 0.f;
+  static float smooth_mix      = 0.5f;
+  static float smooth_repeats  = 0.f;
+  static float smooth_depth    = 0.f;
+  static float smooth_tone     = 4000.f;
+  static float smooth_verb_lpf = 8500.f;
+
+  // Block-rate glide for LFO amplitude — avoids 1 kHz step clicks on depth knob.
+  smooth_depth += 0.02f * (p.depth - smooth_depth);
   const MorphParams mp_lfo = ComputeMorph(smooth_morph);
   mod_lfo.SetAmp(smooth_depth * mp_lfo.mod_depth_scale);
 
-  // Delay time in samples
-  const float base_delay_smp = time_s * static_cast<float>(kSampleRate);
+  const float base_delay_smp = p.time_s * static_cast<float>(kSampleRate);
 
-  // BBD bandwidth: cutoff narrows with longer delay time, matching real
-  // bucket-brigade (MN3005) chip behaviour — 9 kHz at 50 ms, 4 kHz at 1 s.
-  // expf is computed block-rate (once per 48 samples) then applied per-sample.
-  const float bbd_cutoff = fminf(9000.f, fmaxf(2000.f, 4000.f / time_s));
-  const float bbd_c      = 1.f - expf(-kTwoPi * bbd_cutoff / static_cast<float>(kSampleRate));
-
-  // ── Per-sample DSP loop ───────────────────────────────────────────────────────
-
-  static float smooth_verb_lpf = 8500.f;
+  // BBD bandwidth narrows with longer delay time — real MN3005 behaviour.
+  const float bbd_cutoff = fminf(9000.f, fmaxf(2000.f, 4000.f / p.time_s));
+  const float bbd_c      = OnePoleCoeff(bbd_cutoff, static_cast<float>(kSampleRate));
 
   // ── Block-rate reverb + tone config ────────────────────────────────────────
-  // reverb.SetFeedback / reverb.SetLpFreq each do one expf() — cheap, no gating needed.
   {
     const MorphParams mp_b = ComputeMorph(smooth_morph);
-    const float rev_decay_b = lerpf(mp_b.reverb_decay, 0.999f, freeze_blend);
+    const float rev_decay_b = lerpf(mp_b.reverb_decay, 0.999f, p.freeze_blend);
     float eff_decay_b = rev_decay_b;
     if (short_plate)
-      eff_decay_b = frozen_now ? 0.999f : fminf(rev_decay_b, 0.80f);
+      eff_decay_b = p.frozen_now ? 0.999f : fminf(rev_decay_b, 0.80f);
     const float shimmer_amt_b = shimmer_on ? 0.25f * mp_b.reverb_send : 0.f;
-    if (shimmer_amt_b > 0.001f && !frozen_now)
+    if (shimmer_amt_b > 0.001f && !p.frozen_now)
       eff_decay_b = fminf(eff_decay_b, 0.93f);
     reverb.SetFeedback(eff_decay_b);
     smooth_verb_lpf += 0.01f * (mp_b.reverb_lpf_hz - smooth_verb_lpf);
     reverb.SetLpFreq(smooth_verb_lpf, static_cast<float>(kSampleRate));
   }
 
-  // tone_filter.SetFreq() recomputes SVF coefficients. Advance smooth_tone and
-  // call SetFreq once per block instead of 48× — imperceptible difference.
-  smooth_tone += 0.01f * (tone_hz - smooth_tone);
+  smooth_tone += 0.01f * (p.tone_hz - smooth_tone);
   tone_filter.SetFreq(smooth_tone);
 
   for (size_t i = 0; i < size; ++i) {
     const float dry = in[0][i];
 
-    // ── Per-sample parameter smoothing (eliminates 1 kHz staircase whine) ──
-    smooth_morph   += kSmooth * (morph_raw - smooth_morph);
-    smooth_mix     += kSmooth * (mix_raw   - smooth_mix);
-    smooth_repeats += kSmooth * (repeats   - smooth_repeats);
+    // Per-sample smoothing eliminates 1 kHz staircase whine from block-rate updates.
+    smooth_morph   += kSmooth * (p.morph_raw - smooth_morph);
+    smooth_mix     += kSmooth * (p.mix_raw   - smooth_mix);
+    smooth_repeats += kSmooth * (p.repeats   - smooth_repeats);
     const float morph = smooth_morph;
     const float mix   = smooth_mix;
 
-    // Advance bypass ramp (linear, 5 ms)
     if (bypass_ramp < bypass_target)
       bypass_ramp = fminf(bypass_ramp + kBypassRampRate, bypass_target);
     else if (bypass_ramp > bypass_target)
       bypass_ramp = fmaxf(bypass_ramp - kBypassRampRate, bypass_target);
 
-    // fb per-sample: eliminates ADC jitter on KNOB_3 creating a 1 kHz AM tone.
-    const float fb = lerpf(smooth_repeats, 0.999f, freeze_blend);
-
+    // fb per-sample: eliminates ADC jitter on KNOB_3 → 1 kHz AM tone.
+    const float fb = lerpf(smooth_repeats, 0.999f, p.freeze_blend);
     const MorphParams mp = ComputeMorph(morph);
-
-    // shimmer_amt per-sample from morph (used for mix scaling below).
-    // Reverb API config (SetFeedback / SetLpFreq) is done once per block above.
     const float shimmer_amt = shimmer_on ? 0.25f * mp.reverb_send : 0.f;
 
-    // DC block (removes low-frequency offset from guitar pickups)
+    // dc_block → tanhf preamp (NJM4558 op-amp soft clip) → SA571 compress
     float sig = dc_block.Process(dry);
-
-    // ── DMM signal chain ──────────────────────────────────────────────────────
-    //
-    // 1. Preamp: scale to drive level, then tanhf for op-amp soft clip.
-    //    tanhf here is the saturation character — NOT in a feedback path,
-    //    so no waveform-flattening accumulation risk.
     const float preamp_out = tanhf(sig * preamp_gain);
+    const float comp_out   = dmm.Compress(preamp_out) * post_gain;
+    const float aa_out     = dmm.AaFilter(comp_out);
 
-    // 2. SA571 compressor: RMS 2:1 gain reduction before the BBD.
-    //    Attack ~5 ms lets transients punch through (the DMM "snap").
-    //    Release ~60 ms causes the characteristic sag on sustain notes.
-    const float comp_out = dmm.Compress(preamp_out) * post_gain;
-
-    // 3. Anti-alias LPF (2-pole Butterworth, 8 kHz) — before BBD write.
-    //    Removes content the BBD can't reproduce; adds the slight HF rolloff
-    //    present on all DMM dry tones even without delay.
-    const float aa_out = dmm.AaFilter(comp_out);
-
-    // ── Tone filter ────────────────────────────────────────────────────────────
     tone_filter.Process(aa_out);
-    const float tape_out = tone_filter.Low();  // Low-pass output
+    const float tape_out = tone_filter.Low();
 
-    // ── Delay with LFO modulation ──────────────────────────────────────────────
-    // LFO modulates delay time by ±1.5% (wow/flutter range).
-    // Chorus/Vibrato modes use the same LFO but at higher rates.
+    // Delay with LFO modulation (±1.5% — wow/flutter range).
     const float lfo_val    = mod_lfo.Process();
     float       target_smp = base_delay_smp + lfo_val * base_delay_smp * 0.015f;
     target_smp = fmaxf(target_smp, 48.f);
     target_smp = fminf(target_smp, static_cast<float>(kMaxDelaySmp - 1));
-
-    // One-pole smoothing — ~50 ms ramp eliminates zipper / chirp artifacts
     smooth_delay_smp += 0.0004f * (target_smp - smooth_delay_smp);
 
     delay_line.SetDelay(smooth_delay_smp);
     const float delay_out = delay_line.Read();
 
-    // 4. Feedback path LPF: warms each successive repeat — one-pole at ~5 kHz.
-    //    Feeds back through the BBD-bandwidth LPF too, so long echoes get
-    //    progressively darker and thicker, exactly like the real DMM.
-    const float fb_out = dmm.FbFilter(delay_out);
+    const float fb_out      = dmm.FbFilter(delay_out);
+    const float delay_input = tape_out * (1.f - p.freeze_blend);
 
-    // During freeze, fade new input to zero so delay just recirculates.
-    const float delay_input = tape_out * (1.f - freeze_blend);
-
-    // 5. BBD bandwidth LPF on the write path (block-rate bbd_c coefficient).
-    //    At short times: near-transparent (~9 kHz).
-    //    At long times: dark (~2 kHz) — matches real MN3005 characteristics.
-    //
-    //    Feedback soft-clip: tanhf only on the recycled signal, not the clean input.
-    //    Models the BBD input op-amp clipping — repeats get progressively warmer/dirtier
-    //    as they accumulate, exactly like the real DMM at higher feedback settings.
-    //    Safe here: PitchShifter is in the shimmer loop, not the delay loop.
-    const float fb_sig    = fb_out * fb;
-    const float fb_sat    = tanhf(fb_sig * 2.f) * 0.5f;
+    // Feedback soft-clip — BBD input op-amp model. Safe — PitchShifter lives
+    // in the shimmer feedback loop, not this delay loop.
+    const float fb_sig = fb_out * fb;
+    const float fb_sat = tanhf(fb_sig * 2.f) * 0.5f;
     delay_line.Write(dmm.BbdFilter(delay_input, bbd_c) + fb_sat);
 
-    // 6. Anti-image LPF after BBD (same 8 kHz Butterworth coefficients as aa).
-    //    Reconstruction filter; also rounds off any BBD clock-noise edges.
-    const float ai_out = dmm.AiFilter(delay_out);
+    const float ai_out   = dmm.AiFilter(delay_out);
+    const float expanded = ai_out;  // no expander — digital has no noise floor
 
-    // 7. No expander — digital has no analog noise floor to suppress.
-    //    The compressor's attack/release character is fully preserved.
-    const float expanded = ai_out;
-
-    // ── Reverb + shimmer feedback loop ────────────────────────────────────────
-    //
-    // NO tanhf inside the loop! tanhf in a feedback loop progressively
-    // flattens the waveform toward a square shape. PitchShifter uses
-    // sinusoidal grain crossfades — when both grains read flat-topped
-    // (tanhf-saturated) waveforms, they cancel during crossfade and the
-    // output drops to zero. That's the "cutout."
-    //
-    // ReverbSc internally scales output by ×0.35, so levels are naturally
-    // modest. Linear gain scaling keeps the loop stable without changing
-    // the waveshape.
-    //
+    // ── Reverb + shimmer feedback loop ───────────────────────────────────────
+    // NO tanhf inside this loop — see AGENTS.md constraint #7.
     if (!std::isfinite(shimmer.buf)) shimmer.buf = 0.f;
 
-    // Reverb input: crossfade tone-filtered signal → BBD-expanded output.
-    // expanded carries the full DMM delay character; tape_out is the dry tone.
     const float verb_src = lerpf(tape_out, expanded, mp.delay_send)
-                         * (1.f - freeze_blend);
+                         * (1.f - p.freeze_blend);
     float pre_verb_l = verb_src + shimmer.buf * shimmer_amt;
 
-    // Gate reverb when its contribution to the mix would be inaudible.
-    // reverb_send < 0.005 → output scaling < 0.5% → silent in the mix.
     float verbL, verbR;
-    if(mp.reverb_send > 0.005f || shimmer_amt > 0.001f)
-    {
+    if (mp.reverb_send > 0.005f || shimmer_amt > 0.001f) {
       reverb.Process(pre_verb_l, &verbL, &verbR);
+    } else {
+      verbL = verbR = 0.f;
     }
-    else
-    {
-        verbL = verbR = 0.f;
-    }
-
-    // Guard against NaN (can propagate from reverb internal state)
     if (!std::isfinite(verbL)) verbL = 0.f;
     if (!std::isfinite(verbR)) verbR = 0.f;
 
     shimmer.Process(verbL, shimmer_amt);
 
-    // ── Output mix ────────────────────────────────────────────────────────────
-    //
-    // Dry path: crossfade tape→delay (same blend as reverb input).
-    // Reverb blends in on top, scaled by reverb_send.
-    //
-    // tanhf on verbL/verbR before the 2.0× scale: at typical levels (verbL ≤ 0.7)
-    // the reduction is <10% and the scale factor compensates. At extreme shimmer
-    // build-up (verbL = 2+) it prevents the final tanhf from hitting near-unity
-    // (≈0.999) which sounds like a harsh brick-wall clip.
-    // Safe: shimmer path already consumed raw verbL above this point.
-    const float dry_path = lerpf(tape_out, expanded, mp.delay_send);
+    // Output mix — dry path crossfades tape→delay (same blend as reverb input).
+    const float dry_path  = lerpf(tape_out, expanded, mp.delay_send);
     const float dry_level = fmaxf(0.15f, 1.f - mp.reverb_send * 0.7f);
-    const float wetL = dry_path * dry_level
-                     + tanhf(verbL) * mp.reverb_send * 2.0f;
-    const float wetR = dry_path * dry_level
-                     + tanhf(verbR) * mp.reverb_send * 2.0f;
+    const float wetL = dry_path * dry_level + tanhf(verbL) * mp.reverb_send * 2.0f;
+    const float wetR = dry_path * dry_level + tanhf(verbR) * mp.reverb_send * 2.0f;
 
-    // Single tanhf at the output — NOT in a feedback loop, so no
-    // waveform flattening. Just smooth, warm analog-style limiting.
     out[0][i] = lerpf(dry, tanhf(wetL), mix * bypass_ramp);
     out[1][i] = lerpf(dry, tanhf(wetR), mix * bypass_ramp);
   }

@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstddef>
 #include "daisysp.h"
+#include "constants.h"
 
 // ── BBD chorus — Roland SRE-555 / SDD-320 multi-algorithm ────────────────────
 //
@@ -45,7 +46,6 @@ struct BbdChorus {
   static constexpr float  kCenterMs  = 12.f;
   static constexpr float  kSwingMs   =  8.f;
   static constexpr float  kEmphHz    = 3000.f;
-  static constexpr float  kTwoPi     = 6.28318530718f;
 
   // Trapezoidal segments — rise/fall ratio is the SDD-320 character control.
   // 20/30/20/30 produces ~40% of the period in pitch-stable holds.
@@ -92,8 +92,8 @@ struct BbdChorus {
     pitch_     = p;
     center_smp = kCenterMs * 0.001f * sr;
     swing_smp  = kSwingMs  * 0.001f * sr;
-    emph_c     = 1.f - expf(-kTwoPi * kEmphHz   / sr);
-    xfeed_c    = 1.f - expf(-kTwoPi * 800.f      / sr);
+    emph_c     = OnePoleCoeff(kEmphHz, sr);
+    xfeed_c    = OnePoleCoeff(800.f,    sr);
     SetRate(0.5f, sr);
     Reset();
   }

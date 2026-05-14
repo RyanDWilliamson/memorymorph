@@ -1,5 +1,6 @@
 #pragma once
 #include <cmath>
+#include "constants.h"
 
 // ── DMM signal chain state and DSP ───────────────────────────────────────────
 //
@@ -45,7 +46,6 @@ struct DmmChain {
   // Compute filter coefficients from the audio sample rate.
   // Must be called once before audio starts.
   void Init(float sr) {
-    static constexpr float kTwoPi = 6.28318530718f;
     // 2-pole Butterworth LPF at 8 kHz — bilinear transform, Q = 1/√2.
     const float wc   = kTwoPi * 8000.f / sr;
     const float q    = 0.7071f;
@@ -58,7 +58,7 @@ struct DmmChain {
     aa_a1 =  2.f * (k2 - 1.f) * norm;
     aa_a2 =  (k2 - k / q + 1.f) * norm;
     // One-pole feedback LPF at 5 kHz
-    fb_lpf_c = 1.f - expf(-kTwoPi * 5000.f / sr);
+    fb_lpf_c = OnePoleCoeff(5000.f, sr);
     Reset();
   }
 

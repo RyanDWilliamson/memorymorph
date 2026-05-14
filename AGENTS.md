@@ -48,7 +48,8 @@ git submodule update --init --recursive
 
 ```
 src/hothouse.h / hothouse.cpp      — HotHouse board support (do NOT modify)
-src/MemoryMorph/memory_morph.cpp   — top-level DSP + control logic (mode dispatcher + both per-sample loops)
+src/MemoryMorph/memory_morph.cpp   — AudioCallback dispatcher + DmmBlock / Sdd555Block per-sample loops + main()
+src/MemoryMorph/constants.h        — shared math: kTwoPi, kSampleRateF, OnePoleCoeff()
 src/MemoryMorph/morph.h            — MorphParams + ComputeMorph() interpolation (DMM)
 src/MemoryMorph/plate_reverb.h     — PlateReverb (Schroeder mono-in/stereo-out, DMM)
 src/MemoryMorph/dmm_chain.h        — DmmChain (SA571 compander + BBD/biquad filters, DMM)

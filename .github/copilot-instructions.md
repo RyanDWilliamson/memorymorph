@@ -74,7 +74,8 @@ grain crossfades cancel → shimmer cuts out. `tanhf` is only permitted at the
 
 ```
 src/hothouse.h / hothouse.cpp      — HotHouse hardware proxy (do not modify)
-src/MemoryMorph/memory_morph.cpp   — top-level DSP + control logic; mode dispatcher
+src/MemoryMorph/memory_morph.cpp   — AudioCallback dispatcher + DmmBlock / Sdd555Block per-sample loops + main()
+src/MemoryMorph/constants.h        — shared math (kTwoPi, kSampleRateF, OnePoleCoeff)
 src/MemoryMorph/morph.h            — MorphParams + ComputeMorph() interpolation (DMM)
 src/MemoryMorph/plate_reverb.h     — PlateReverb (Schroeder mono-in/stereo-out, DMM)
 src/MemoryMorph/dmm_chain.h        — DmmChain (SA571 compander + BBD filters, DMM)

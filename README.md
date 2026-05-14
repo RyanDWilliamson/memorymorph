@@ -92,7 +92,8 @@ hothouse/
 │   ├── hothouse.h                 # HotHouse board support
 │   ├── hothouse.cpp
 │   └── MemoryMorph/
-│       ├── memory_morph.cpp       # top-level DSP + control logic
+│       ├── memory_morph.cpp       # AudioCallback dispatcher + DmmBlock / Sdd555Block + main()
+│       ├── constants.h            # shared math (kTwoPi, OnePoleCoeff)
 │       ├── morph.h                # MORPH macro interpolation (DMM)
 │       ├── plate_reverb.h         # Schroeder plate reverb (DMM)
 │       ├── dmm_chain.h            # SA571 compander + BBD filters (DMM)

@@ -1,6 +1,7 @@
 #pragma once
 #include <cmath>
 #include <cstddef>
+#include "constants.h"
 
 // ── Spring reverb — Accutronics 8AB2D1A 3-spring tank model ─────────────────
 //
@@ -101,7 +102,6 @@ struct SpringReverb {
   static constexpr size_t kAp1B = 97,  kAp2B = 127, kAp3B = 179;
   static constexpr size_t kAp1C = 101, kAp2C = 139, kAp3C = 197;
 
-  static constexpr float kTwoPi      = 6.28318530718f;
   static constexpr float kInputLpHz  = 5000.f;   // tank natural HF rolloff
   static constexpr float kAllpassG   = 0.6f;     // diffusion strength
   static constexpr float kXcoupling  = 0.25f;    // cross-coupling gain — too high → instability
@@ -126,7 +126,7 @@ struct SpringReverb {
 
   // ── Init / Reset ──────────────────────────────────────────────────────────
   void Init(float sr) {
-    input_lpf_c = 1.f - expf(-kTwoPi * kInputLpHz / sr);
+    input_lpf_c = OnePoleCoeff(kInputLpHz, sr);
     sa.Init(main_a, kMainA, ap1a, kAp1A, ap2a, kAp2A, ap3a, kAp3A);
     sb.Init(main_b, kMainB, ap1b, kAp1B, ap2b, kAp2B, ap3b, kAp3B);
     sc.Init(main_c, kMainC, ap1c, kAp1C, ap2c, kAp2C, ap3c, kAp3C);
