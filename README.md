@@ -40,9 +40,10 @@ with an optional shimmer (PitchShifter +12 st) feedback loop. **MORPH**
 
 A circuit-level model of the Roland SRE-555 Chorus Echo fused with the
 SDD-320 Dimension D: NE570 log-domain VCA compander (the "dirt source") →
-BBD-style chorus with trapezoidal LFO → 3-spring Accutronics tank → choice
-of AMS Non-Lin gated verb or a Wildcard Resonator verb. **MORPH** sweeps
-Chorus → +Spring → +Verb.
+tape echo (single-tap, tap-syncable, soft-clipped feedback) → BBD-style
+chorus with trapezoidal LFO → 3-spring Accutronics tank → choice of AMS
+Non-Lin gated verb or a Wildcard Resonator verb. **MORPH** sweeps
+Echo → +Chorus → +Verb.
 
 ### Mode switch
 
@@ -54,16 +55,16 @@ Toggle back to DMM the same way.
 
 | Control | Function |
 |---|---|
-| Knob 1 | **Morph** — Chorus only → +Spring → +Verb |
-| Knob 2 | Chorus rate (LFO Hz, or Eventide pre-delay ms) |
-| Knob 3 | Chorus depth (LFO swing or detune cents) |
-| Knob 4 | Spring reverb decay |
-| Knob 5 | Mechanical age — wow depth + HF rolloff |
+| Knob 1 | **Morph** — Echo only → +Chorus → +Verb |
+| Knob 2 | Tape echo time 50 ms – 500 ms log (authentic SRE-555 range, tap-synced via FS1) |
+| Knob 3 | Tape echo feedback / repeats |
+| Knob 4 | Verb decay (whichever verb SW3 selects) |
+| Knob 5 | Mechanical age — HF rolloff + breathing LFO |
 | Knob 6 | **Mix** — dry/wet blend |
-| Toggle 1 | Input drive: ↑ Hot · — Warm · ↓ Clean |
+| Toggle 1 | NE570 drive (linear, no preamp clip): ↑ Hot · — Warm · ↓ Clean |
 | Toggle 2 | Chorus type: ↑ BBD (CE-1) · — Eventide pitch · ↓ Dimension D |
 | Toggle 3 | Verb: ↑ AMS Non-Lin · — Wildcard Resonator · ↓ Spring only |
-| Footswitch 1 | Tap tempo (syncs chorus rate) · Freeze |
+| Footswitch 1 | Tap tempo (syncs echo time) · Freeze |
 | Footswitch 2 | **Bypass** — LED 2 on = active |
 
 ## Building

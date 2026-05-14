@@ -34,19 +34,19 @@
 //                 DFU bootloader: FS1 only, hold 10 s + all toggles DOWN + mix 0
 //
 // ── SDD-555 mode: Controls ───────────────────────────────────────────────────
-//   KNOB_1  Morph        — Chorus only → +Spring → +Verb
-//   KNOB_2  Chorus rate  — LFO Hz or Eventide pre-delay ms
-//   KNOB_3  Chorus depth — LFO swing or detune cents
-//   KNOB_4  Spring decay — spring reverb feedback
-//   KNOB_5  Mech age     — wow depth + HF rolloff
+//   KNOB_1  Morph        — Echo only → +Chorus → +Verb
+//   KNOB_2  Echo time    — tape echo 50–500 ms log (authentic SRE-555, tap-synced)
+//   KNOB_3  Echo feedback — tape echo repeats 0 – 0.95
+//   KNOB_4  Verb decay   — whichever verb SW3 selects
+//   KNOB_5  Mech age     — HF rolloff + breathing LFO
 //   KNOB_6  Mix          — dry/wet blend
 //
-//   TOGGLESWITCH_1  Input drive: UP=Hot  MID=Warm  DOWN=Clean
+//   TOGGLESWITCH_1  NE570 drive (LINEAR, no preamp clip): UP=Hot MID=Warm DOWN=Clean
 //   TOGGLESWITCH_2  Chorus: UP=BBD (CE-1)  MID=Eventide pitch  DOWN=Dimension D
 //   TOGGLESWITCH_3  Verb: UP=AMS Non-Lin  MID=Wildcard Resonator  DOWN=Spring only
 //
 //   FOOTSWITCH_2  Bypass toggle    (LED_2 on = active)
-//   FOOTSWITCH_1  Tap tempo (syncs chorus rate) / Freeze
+//   FOOTSWITCH_1  Tap tempo (syncs echo time) / Freeze
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <cmath>
@@ -137,6 +137,53 @@ static Ne570       ne570_exp_r;  // post-BBD expander, R channel
 static BbdChorus    chorus;
 static SpringReverb spring;       // 3-spring Accutronics 8AB2D1A model
 static NlVerb       nl_verb;      // AMS Non-Lin gated + Wildcard Resonator
+
+// ── MechAge inline state (SDD-555) ───────────────────────────────────────────
+// "Mechanical age" — KNOB_5 in SDD-555 mode. Simulates worn tape / aged tank:
+// HF rolloff cutoff lerps from ~18 kHz (pristine) to ~4 kHz (worn), with a
+// slow ~0.4 Hz "breathing" LFO modulating the cutoff by ±20% × age. No big
+// delay line — under 100 bytes of state, kept inline per the plan.
+static float mech_lpf_z_l   = 0.f;
+static float mech_lpf_z_r   = 0.f;
+static float mech_wow_phase = 0.f;
+
+// ── SDD-555 tape echo state ──────────────────────────────────────────────────
+// Reuses the existing SDRAM `delay_line` (mono, 2 s) — DMM and SDD-555 never
+// run simultaneously, so the buffer is single-owner per mode. delay_line.Init()
+// is called on every mode switch to zero out the previous mode's residue.
+//
+// One-pole 6 kHz LPF in the feedback path models tape's natural HF rolloff
+// (each repeat gets progressively darker). `tanhf` on the feedback signal
+// soft-clips at high amplitudes — safe here because the chorus PitchShifter
+// (Eventide mode) is in a separate forward path, NOT this feedback loop.
+static float sdd_fb_lpf_z       = 0.f;
+static float sdd_smooth_echo_smp = 2400.f;
+
+// ── SDD-555 MORPH lerp table ─────────────────────────────────────────────────
+// Anchors define the three-zone sweep across KNOB_1 in SDD-555 mode. Tape
+// echo runs at full level across all anchors — the morph controls only how
+// much chorus motion and reverb get layered on top of the echo.
+//   0.0  Echo only         : no chorus modulation, no verb
+//   0.5  Echo + Chorus      : full chorus depth, light verb (the "Chorus Echo" sound)
+//   1.0  Echo + Chorus + Verb : full ambient wash
+struct SddMorphParams {
+  float verb_send;
+  float chorus_depth_scale;
+};
+
+static inline SddMorphParams ComputeSddMorph(float m) {
+  static constexpr SddMorphParams a0 = { 0.0f, 0.0f };
+  static constexpr SddMorphParams a1 = { 0.3f, 1.0f };
+  static constexpr SddMorphParams a2 = { 1.0f, 1.0f };
+  if (m < 0.5f) {
+    const float t = m * 2.f;
+    return { lerpf(a0.verb_send,          a1.verb_send,          t),
+             lerpf(a0.chorus_depth_scale, a1.chorus_depth_scale, t) };
+  }
+  const float t = (m - 0.5f) * 2.f;
+  return { lerpf(a1.verb_send,          a2.verb_send,          t),
+           lerpf(a1.chorus_depth_scale, a2.chorus_depth_scale, t) };
+}
 
 // Smoothed delay time to avoid zipper artifacts when turning the knob
 static float smooth_delay_smp = 2400.f;  // ~50 ms default
@@ -245,6 +292,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
       chorus.Reset();
       spring.Reset();
       nl_verb.Reset();
+      mech_lpf_z_l = mech_lpf_z_r = 0.f;
+      sdd_fb_lpf_z = 0.f;
     }
     for (size_t i = 0; i < size; ++i) {
       out[0][i] = in[0][i];
@@ -257,32 +306,81 @@ void AudioCallback(AudioHandle::InputBuffer  in,
   // Used by both modes' per-sample mix/parameter smoothing.
   static constexpr float kSmooth = 0.0002f;
 
-  // ── SDD-555 mode — Phase 3: drive → compress → BBD chorus → expand ────────────
-  // Full chain (spring → verb) added in Phases 5–6. Phase 4 will add Eventide
-  // and Dimension D algorithms; for now ProcessBbd is the only chorus mode.
+  // ── SDD-555 mode — Phase 7: drive → compress → chorus → expand →            ──
+  //                            MechAge → SW3 verb (MORPH-scaled) → mix          ──
   if (active_mode == ActiveMode::SDD555) {
-    // SW1 input drive — Hot / Warm / Clean preamp gain into the compander.
+    // SW1 input drive — LINEAR gain into the NE570 (no preamp clip).
+    // The real SRE-555 input was a clean JRC4558 op-amp buffer with ~24× headroom
+    // at guitar levels; it didn't clip. All program-dependent dirt comes from
+    // the NE570's polynomial + the compressor's RMS pumping in Ne570::Compress().
+    // Higher drive just pushes the NE570 harder — more polynomial coloration and
+    // more compressor pumping, never square-wave saturation.
     float sdd_drive;
-    if      (sw1 == Hothouse::TOGGLESWITCH_UP)     sdd_drive = 4.0f;  // Hot
-    else if (sw1 == Hothouse::TOGGLESWITCH_MIDDLE) sdd_drive = 2.0f;  // Warm
-    else                                            sdd_drive = 1.0f;  // Clean
+    if      (sw1 == Hothouse::TOGGLESWITCH_UP)     sdd_drive = 2.0f;  // Hot
+    else if (sw1 == Hothouse::TOGGLESWITCH_MIDDLE) sdd_drive = 1.0f;  // Warm
+    else                                            sdd_drive = 0.5f;  // Clean
 
-    // KNOB_2 / KNOB_3 — chorus rate / depth. Raw 0–1 values; the BBD chorus
-    // uses its own ranges, separate from p_time / p_repeats which are mapped
-    // for the DMM mode. Block-rate config is fine — trapezoidal LFO advances
-    // linearly so coefficient updates don't cause artifacts.
-    const float chorus_rate_knob = hw.GetKnobValue(Hothouse::KNOB_2);
-    const float chorus_depth_knob = hw.GetKnobValue(Hothouse::KNOB_3);
-    const float chorus_rate_hz = 0.1f + chorus_rate_knob * 2.9f;  // 0.1–3 Hz
-    chorus.SetRate(chorus_rate_hz, static_cast<float>(kSampleRate));
-    chorus.SetDepth(chorus_depth_knob);
-
-    // KNOB_4 → reverb decay 0–0.95. Same knob feeds whichever algorithm SW3
-    // selects (spring / NlVerb), so the user always has the same physical
-    // control regardless of which verb is active.
+    // Raw knob reads — SDD-555 mappings differ from DMM, so bypass Parameter::Process.
+    // KNOB_2 has its own log curve here (50–500 ms — authentic SRE-555 range)
+    // rather than reusing the DMM 50 ms – 2 s pipeline; the real unit topped out
+    // around 320 ms single-head / 500 ms multi-head, never 2 s.
+    // KNOB_3 → echo feedback. KNOB_4 → verb decay. KNOB_5 → mech age. KNOB_1 → MORPH.
+    const float morph_knob      = hw.GetKnobValue(Hothouse::KNOB_1);
+    const float echo_time_knob  = hw.GetKnobValue(Hothouse::KNOB_2);
+    const float echo_fb_knob    = hw.GetKnobValue(Hothouse::KNOB_3);
     const float verb_decay_knob = hw.GetKnobValue(Hothouse::KNOB_4);
+    const float mech_age_knob   = hw.GetKnobValue(Hothouse::KNOB_5);
+
+    const SddMorphParams sm = ComputeSddMorph(morph_knob);
+    const float echo_fb     = echo_fb_knob * 0.95f;  // hard cap below self-oscillation
+
+    // Echo time. Log mapping 50 → 500 ms; tap-tempo override clamped to 500 ms.
+    // tap cancellation is handled by the GetTimeS() call at the top of
+    // AudioCallback (its prev_knob_time tracks KNOB_2 raw → seconds), so
+    // turning KNOB_2 still clears tap.active here without extra plumbing.
+    static constexpr float kSddMaxEchoS = 0.5f;
+    static constexpr float kSddMinEchoS = 0.05f;
+    const float sdd_knob_s = kSddMinEchoS
+                           * expf(echo_time_knob * logf(kSddMaxEchoS / kSddMinEchoS));
+    float echo_time_s;
+    if (tap.IsActive() && tap.tempo_s > 0.f) {
+      echo_time_s = fminf(kSddMaxEchoS, tap.tempo_s);
+    } else {
+      echo_time_s = sdd_knob_s;
+    }
+
+    // Glide the per-sample read pointer to avoid pitch chirp on knob moves.
+    const float echo_target_smp = echo_time_s * static_cast<float>(kSampleRate);
+    sdd_smooth_echo_smp += 0.01f * (echo_target_smp - sdd_smooth_echo_smp);
+    sdd_smooth_echo_smp = fmaxf(48.f,
+                                fminf(static_cast<float>(kMaxDelaySmp - 1),
+                                      sdd_smooth_echo_smp));
+    delay_line.SetDelay(sdd_smooth_echo_smp);
+
+    // Feedback path LPF coefficient — tape darkens repeats at ~6 kHz cutoff.
+    const float sdd_fb_lpf_c = 1.f - expf(-kTwoPi * 6000.f
+                                          / static_cast<float>(kSampleRate));
+
+    // Chorus rate is no longer directly knob-controlled in SDD-555 mode (KNOB_2
+    // is now echo time). Fixed at 0.6 Hz — a musical default for slow chorus.
+    // SW2 selects character (BBD / Eventide / Dimension D); MORPH controls depth.
+    chorus.SetRate(0.6f, static_cast<float>(kSampleRate));
+    chorus.SetDepth(sm.chorus_depth_scale);
+
     spring.SetDecay (verb_decay_knob * 0.95f);
     nl_verb.SetDecay(verb_decay_knob * 0.95f);
+
+    // MechAge: HF cutoff lerps 18 kHz → 4 kHz with age; a slow ~0.4 Hz LFO
+    // modulates it ±20% × age for "breathing." Block-rate update is fine —
+    // the LFO is slow, the LPF state advances per sample.
+    static constexpr float kMechWowHz = 0.4f;
+    mech_wow_phase += kMechWowHz * static_cast<float>(size)
+                                 / static_cast<float>(kSampleRate);
+    if (mech_wow_phase >= 1.f) mech_wow_phase -= 1.f;
+    const float mech_lfo     = sinf(mech_wow_phase * kTwoPi);
+    const float mech_base_hz = lerpf(18000.f, 4000.f, mech_age_knob);
+    const float mech_hz      = mech_base_hz * (1.f + mech_lfo * mech_age_knob * 0.2f);
+    const float mech_c       = 1.f - expf(-kTwoPi * mech_hz / static_cast<float>(kSampleRate));
 
     static float sdd_smooth_mix = 0.f;
 
@@ -297,35 +395,50 @@ void AudioCallback(AudioHandle::InputBuffer  in,
       else if (bypass_ramp > bypass_target)
         bypass_ramp = fmaxf(bypass_ramp - kBypassRampRate, bypass_target);
 
-      // dc_block → input drive → NE570 compress (mono, VCA dirt baked in).
+      // dc_block → linear drive → NE570 compress (VCA polynomial dirt baked in).
+      // No tanhf preamp here — that's DMM's NJM4558 op-amp model. The SRE-555
+      // input was clean; the NE570 itself is the only intentional nonlinearity.
       float sig = dc_block.Process(dry);
-      sig = tanhf(sig * sdd_drive);
+      sig = sig * sdd_drive;
       sig = ne570.Compress(sig);
 
-      // Chorus algorithm dispatch (SW2): UP=BBD / MID=Eventide / DOWN=Dimension D.
-      // Branch is on a block-rate constant — modern branch predictor handles
-      // this cleanly without hoisting to three separate loops.
+      // ── Tape echo (SRE-555 echo section) ────────────────────────────────
+      // Single tap with tape-darkened, soft-clipped feedback. Output is the
+      // mono dry+wet sum that feeds the chorus, so every repeat gets chorused
+      // and verbed downstream — exactly like the real SRE-555 routing.
+      const float echo_repeat = delay_line.Read();
+      sdd_fb_lpf_z += sdd_fb_lpf_c * (echo_repeat - sdd_fb_lpf_z);
+      const float fb_sat = tanhf(sdd_fb_lpf_z * echo_fb);
+      delay_line.Write(sig + fb_sat);
+      sig = sig + echo_repeat;
+
+      // Chorus algorithm (SW2). Branch on block-rate constant — predictor handles cleanly.
       float wetL, wetR;
       if      (sw2 == Hothouse::TOGGLESWITCH_UP)     chorus.ProcessBbd       (sig, wetL, wetR);
       else if (sw2 == Hothouse::TOGGLESWITCH_MIDDLE) chorus.ProcessEventide  (sig, wetL, wetR);
       else                                            chorus.ProcessDimensionD(sig, wetL, wetR);
 
-      // Matched expanders per channel — each tracks its own envelope so the
-      // compander pair restores dynamics accurately on stereo BBD output.
+      // Matched stereo expanders.
       const float exp_l = ne570_exp_l.Expand(wetL);
       const float exp_r = ne570_exp_r.Expand(wetR);
 
-      // SW3 verb selection: UP=AMS Non-Lin / MID=Wildcard / DOWN=Spring.
-      // Only one reverb runs per sample — the others' state holds where it
-      // was left. Reverb send/return level is fixed at 0.5 for Phase 6;
-      // Phase 7 will MORPH-scale it so the verb fades in across the macro sweep.
-      const float verb_in = 0.5f * (exp_l + exp_r);
+      // MechAge LPF per channel — block-rate cutoff, per-sample state advance.
+      mech_lpf_z_l += mech_c * (exp_l - mech_lpf_z_l);
+      mech_lpf_z_r += mech_c * (exp_r - mech_lpf_z_r);
+      const float aged_l = mech_lpf_z_l;
+      const float aged_r = mech_lpf_z_r;
+
+      // SW3 verb selection. Only one runs per sample; the others' state holds.
+      const float verb_in = 0.5f * (aged_l + aged_r);
       float verb_l = 0.f, verb_r = 0.f;
       if      (sw3 == Hothouse::TOGGLESWITCH_UP)     nl_verb.ProcessAms     (verb_in, verb_l, verb_r);
       else if (sw3 == Hothouse::TOGGLESWITCH_MIDDLE) nl_verb.ProcessWildcard(verb_in, verb_l, verb_r);
       else                                            spring  .Process       (verb_in, verb_l, verb_r);
-      const float wet_l = exp_l + verb_l * 0.5f;
-      const float wet_r = exp_r + verb_r * 0.5f;
+
+      // MORPH-scaled verb send — at morph=0 the chorus path is dry, at
+      // morph=1 the verb is at full return level.
+      const float wet_l = aged_l + verb_l * sm.verb_send;
+      const float wet_r = aged_r + verb_r * sm.verb_send;
 
       out[0][i] = lerpf(dry, wet_l, mix * bypass_ramp);
       out[1][i] = lerpf(dry, wet_r, mix * bypass_ramp);
@@ -719,6 +832,14 @@ int main() {
       tap.is_freeze = false;
       tap.active    = false;
       active_mode   = (active_mode == ActiveMode::DMM) ? ActiveMode::SDD555 : ActiveMode::DMM;
+      // Zero the shared SDRAM delay line — DMM's BBD content and SDD-555's
+      // tape echo content are both stored here, and neither mode should hear
+      // the other's residue when it takes over. ~384 KB SDRAM write — a few
+      // milliseconds during the LED blink, imperceptible.
+      delay_line.Init();
+      sdd_fb_lpf_z = 0.f;
+      smooth_delay_smp     = 2400.f;
+      sdd_smooth_echo_smp  = 2400.f;
       // PitchShifter is shared between DMM shimmer (+12 st octave, fun=0.3)
       // and SDD-555 Eventide chorus (+0.20 st detune, fun=0). Reconfigure
       // here while audio is stopped so the next StartAudio block reads clean.
