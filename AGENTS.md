@@ -4,11 +4,27 @@
 
 A C++ guitar effects pedal firmware for the **Cleveland Music Co. HotHouse**
 platform (Daisy Seed / STM32H750 ARM Cortex-M7, 480 MHz boost, **48 kHz**).
-Implements a Chase Bliss–inspired morphable effect chain:
-Electro-Harmonix Deluxe Memory Man preamp/compander → BBD delay → ambient
-shimmer reverb, all swept by a single MORPH macro knob.
 
-Current branch under active development: `dmm-deep-dive`.
+The pedal carries **two complete instruments** selectable at runtime via a
+hidden footswitch combo. Boot always lands in DMM mode.
+
+1. **DMM mode** (default) — Chase Bliss–inspired morphable chain:
+   Electro-Harmonix Deluxe Memory Man preamp/compander → BBD delay → ambient
+   shimmer reverb, swept by a single MORPH macro knob.
+2. **SDD-555 mode** — circuit-level model of the Roland SRE-555 Chorus Echo
+   fused with the SDD-320 Dimension D: NE570 VCA compander (the "dirt source")
+   → BBD chorus with trapezoidal LFO → 3-spring Accutronics tank → AMS Non-Lin
+   or Wildcard Resonator verb. Built up in phases; current status below.
+
+Mode switch combo: hold **FS1 + FS2** while all toggles are DOWN and Mix is
+fully dry, for **3 seconds**. Both LEDs blink alternating 3× to confirm.
+
+Current branch: `dmm-deep-dive`. SDD-555 status — Phases 1–6 complete (mode
+dispatch + bypass-aware reset; NE570 compander; BBD/Eventide/Dimension D
+chorus algorithms behind SW2; 3-spring Accutronics tank with cross-coupling
+and KNOB_4 decay; AMS Non-Lin gated reverb + Wildcard Resonator behind SW3).
+Phases 7–8 pending (MORPH lerp table for SDD-555, tap tempo → chorus sync,
+MechAge wow/HF rolloff, on-hardware tuning).
 
 ## Build & flash
 
@@ -28,15 +44,23 @@ git submodule update --init --recursive
 
 ```
 src/hothouse.h / hothouse.cpp      — HotHouse board support (do NOT modify)
-src/MemoryMorph/memory_morph.cpp   — top-level DSP + control logic
-src/MemoryMorph/morph.h            — MorphParams struct + ComputeMorph() interpolation
-src/MemoryMorph/plate_reverb.h     — PlateReverb struct (Schroeder mono-in/stereo-out)
-src/MemoryMorph/dmm_chain.h        — DmmChain struct (SA571 compander + BBD/biquad filters)
-src/MemoryMorph/tap_tempo.h        — TapTempoState struct (FS1 tap/freeze state machine)
-src/MemoryMorph/shimmer.h          — ShimmerVoice struct (HPF + PitchShifter + auto-duck)
+src/MemoryMorph/memory_morph.cpp   — top-level DSP + control logic (mode dispatcher + both per-sample loops)
+src/MemoryMorph/morph.h            — MorphParams + ComputeMorph() interpolation (DMM)
+src/MemoryMorph/plate_reverb.h     — PlateReverb (Schroeder mono-in/stereo-out, DMM)
+src/MemoryMorph/dmm_chain.h        — DmmChain (SA571 compander + BBD/biquad filters, DMM)
+src/MemoryMorph/tap_tempo.h        — TapTempoState (FS1 tap/freeze state machine, shared)
+src/MemoryMorph/shimmer.h          — ShimmerVoice (HPF + PitchShifter + auto-duck, DMM)
+src/MemoryMorph/ne570.h            — Ne570 (NE570 VCA compander with even-order dirt, SDD-555)
+src/MemoryMorph/bbd_chorus.h       — BbdChorus (BBD / Eventide / Dimension D algorithms, SDD-555)
+src/MemoryMorph/spring_reverb.h    — SpringReverb (3-spring Accutronics 8AB2D1A tank, SDD-555)
+src/MemoryMorph/nl_verb.h          — NlVerb (AMS Non-Lin gated + Wildcard Resonator, SDD-555)
 DaisySP/                            — git submodule (do NOT modify)
 libDaisy/                           — git submodule (do NOT modify)
 ```
+
+Each `.h` file is a standalone DSP struct with `Init(sr)` / `Reset()` /
+per-sample inline methods. `memory_morph.cpp` is pure glue — mode dispatch,
+parameter wiring, LED logic, and the two per-sample audio loops.
 
 ## Non-negotiable constraints
 
@@ -75,7 +99,25 @@ rate-limited to 1 kHz via `System::GetNow()`.
 Its internal buffer is hardcoded for 48 kHz operation but the API is fragile.
 Use `DelayLine + Oscillator` LFO instead — already implemented.
 
-### 6. No tanhf in the shimmer feedback loop
+### 6. No `= {0}` on large struct-member arrays
+Aggregate zero-initialisers force buffers into FLASH `.data` instead of BSS,
+wasting flash 1:1 with the buffer size. Use plain declarations and rely on
+BSS zero-init at startup (static storage duration guarantees it):
+
+```cpp
+// WRONG — emits N floats of zeros into FLASH .data
+struct Foo { float buf[2400] = {0}; };
+
+// CORRECT — BSS zeroes at startup, no FLASH cost
+struct Foo { float buf[2400]; };
+```
+
+This bit Phase 5: spring_reverb.h had ~40 KB of `= {0}` arrays and overflowed
+the 128 KB FLASH region by 24 KB. bbd_chorus.h had been wasting ~10 KB silently
+since Phase 3. Single-float defaults (`float foo = 0.f;`) are fine — only the
+aggregate array initialisers waste flash.
+
+### 7. No tanhf in the shimmer feedback loop
 `tanhf` in the **shimmer/reverb feedback path** (reverb → PitchShifter → back to reverb)
 progressively flattens waveforms → grain crossfades cancel → shimmer cuts out.
 
@@ -183,18 +225,293 @@ controlled by SW1 (drive level), not morphed by the knob.
 | Footswitch 2 | `FOOTSWITCH_2` | Bypass (LED 2) |
 | Footswitch 1 | `FOOTSWITCH_1` | Tap tempo short-press / Freeze hold ≥1500 ms (LED 1) |
 
+## Mode switch (DMM ↔ SDD-555)
+
+Detected in the `while(true)` main loop at 1 kHz:
+
+- Both `FOOTSWITCH_1` **and** `FOOTSWITCH_2` pressed
+- All three toggles `TOGGLESWITCH_DOWN`
+- `KNOB_6` (mix) < 0.02
+- Held continuously for **3 seconds**
+
+On trigger: `hw.StopAudio()` → both LEDs blink alternating 3× at 150 ms →
+`tap.is_freeze` / `tap.active` cleared → `active_mode` flipped → `hw.StartAudio()`.
+
+The DFU bootloader hold (10 s + same toggle/mix combo on **FS1 only**) is
+guarded with `!fs2_held` so the mode-switch combo cannot accidentally trigger
+DFU. The bypass-settled early-return resets the **active mode's** state only;
+DMM and SDD-555 chains are isolated.
+
+## SDD-555 signal chain (in progress)
+
+Per-sample path inside `AudioCallback`'s `active_mode == SDD555` dispatch.
+Bracketed sections are pending phases; bullet-listed elements are implemented:
+
+```
+guitar in
+  → dc_block                                       — shared with DMM
+  → tanhf(sig × sdd_drive)                          — SW1: Hot=4× / Warm=2× / Clean=1×
+  → ne570.Compress()                                — NE570 VCA, RMS detector + sidechain HPF + polynomial dirt
+  → SW2 dispatch — chorus algorithm:                — Phase 4
+      UP   chorus.ProcessBbd       : trapezoidal LFO, two taps @ 180° phase offset
+      MID  chorus.ProcessEventide  : static pre-delays + shared PitchShifter (+0.20 st)
+      DOWN chorus.ProcessDimensionD: half-swing trapezoidal LFO + cross-channel HPF
+      common: pre_emp +6 dB / shelf 3 kHz before delay; de_emp_l/r −6 dB after;
+              mono delay line 2400 samples (~50 ms headroom)
+  → ne570_exp_l.Expand(wetL)   ╲
+  → ne570_exp_r.Expand(wetR)   ╱  — matched expanders, one envelope per channel
+  → SW3 verb selection — only one runs per sample:    — Phase 6
+      UP   nl_verb.ProcessAms      : 6-allpass diffusion + envelope-armed gate (AMS RMX16)
+      MID  nl_verb.ProcessWildcard : 5 combs at A2 harmonics (110/220/330/440/550 Hz)
+      DOWN spring.Process          : 3-spring Accutronics tank with cross-coupling
+  → wet_l = exp_l + verb_l * 0.5                       (fixed return level — Phase 7 MORPH-scales it)
+  → wet_r = exp_r + verb_r * 0.5
+  [Phase 7: MechAge inline + MORPH lerp table + tap tempo → chorus rate]
+  → lerpf(dry, wet, mix * bypass_ramp)                 — same bypass pattern as DMM
+```
+
+### Mode switch — PitchShifter reconfiguration
+
+The SDRAM `pitch` object is shared between DMM shimmer and SDD-555 Eventide
+chorus. Only one mode runs at a time so there is no contention, but each
+mode needs different transposition / fun settings. The mode-switch block
+reconfigures the PitchShifter while audio is stopped:
+
+| Mode | Transposition | Fun |
+|---|---|---|
+| DMM (shimmer) | +12 st (octave) | 0.3 (grain jitter — sparkle) |
+| SDD-555 (Eventide) | +0.20 st (~20 cents) | 0.0 (clean detune) |
+
+## SDD-555 NE570 compander model
+
+The NE570 (and SA571) compress via a log-domain VCA whose translinear transfer
+function produces program-dependent even-order harmonic coloration — this is
+the "dirt source" that makes companded BBD units sound alive vs. clean digital.
+
+Model in `ne570.h`:
+
+```cpp
+y = x * gain;
+return tanhf(y + kK2 * y*y + kK3 * y*y*y);   // kK2 = 0.08, kK3 = 0.02
+```
+
+The polynomial is **only on the compressor**. The expander (`Ne570::Expand()`)
+is kept clean so the dirt from compression survives to the output rather than
+being partially cancelled by inverse polynomial expansion.
+
+Time constants are deliberately looser than the DMM's SA571 (~10 ms attack /
+~120 ms release, vs ~5 ms / ~60 ms) — the SRE-555 is "seasoning, not squash":
+
+```cpp
+static constexpr float kAttack  = 0.002083f;  // ~10 ms  at 48 kHz
+static constexpr float kRelease = 0.000174f;  // ~120 ms at 48 kHz
+static constexpr float kMaxGain = 1.8f;
+static constexpr float kHpfC    = 0.02124f;   // shared 164 Hz sidechain HPF
+```
+
+Three `Ne570` instances live in `memory_morph.cpp`: one mono compressor
+(`ne570`) before the BBD, and two matched expanders (`ne570_exp_l/r`) after
+it so each stereo channel's envelope is tracked independently.
+
+## SDD-555 chorus model (three algorithms)
+
+`bbd_chorus.h` — one mono delay line (2400 samples = 50 ms at 48 kHz),
+mono-in / stereo-out. Three algorithms share the same write side, pre-emphasis,
+and per-channel de-emphasis filters; they differ in how the delay line is
+read and how stereo is constructed.
+
+**Shared elements:**
+
+- **Pre-emphasis** (mono write side): `x + HPF(x)` → +6 dB shelf above 3 kHz
+- **De-emphasis** (per channel): `0.5 * (x + LPF(x))` → −6 dB shelf above 3 kHz
+- Pre/de-emphasis shelf corner: 3 kHz. `emph_c = 1 - exp(-2π · 3000 / sr)`
+- **Trapezoidal LFO** (BBD + Dimension D): 20% rise / 30% hold high / 20% fall
+  / 30% hold low — pitch sits still for 60% of each cycle, then ramps.
+
+**SW2 UP — `ProcessBbd` (Roland CE-1 / SRE-555):**
+
+Full trapezoidal LFO depth, two read taps with 180° phase offset, per-channel
+de-emphasis. This is the canonical "chorus" character — pronounced shimmer
+with the LFO's flat-top "settle" replacing continuous sine warble.
+
+**SW2 MID — `ProcessEventide` (Eventide H910 Micropitch):**
+
+No LFO modulation. Two static short reads (~6 ms L, ~10 ms R) for stereo
+decorrelation, then both channels mixed with the shared SDRAM PitchShifter's
+mono output at +0.20 st (~20 cents detune). The detune IS the chorus motion.
+
+**SW2 DOWN — `ProcessDimensionD` (Roland SDD-320):**
+
+Half-swing trapezoidal LFO (~50% of CE-1 depth — subtler), then cross-channel
+HPF subtraction with polarity inversion:
+
+```
+outL = wetL − HPF(wetR)
+outR = wetR − HPF(wetL)
+```
+
+HPF cutoff 800 Hz, 1-pole. The minus sign cancels low-frequency cross-talk
+and reinforces highs — "wider than stereo" without audible modulation.
+`xfeed_c = 1 - exp(-2π · 800 / sr)`.
+
+## SDD-555 spring reverb (Accutronics 8AB2D1A)
+
+`spring_reverb.h` — three parallel spring lines, mono in / stereo out, ~40 KB
+SRAM. The defining "boing + beat" character comes from inter-spring beating
+(three slightly different lengths) and cross-coupled feedback (A→B→C→A cycle).
+
+**Per-spring topology** (`SpringLine`):
+
+```
+in (+ xcoupling)
+  → write main_buf at idx
+  → main_out = main_buf[idx]
+  → 3 series allpass filters (kAllpassG = 0.6)
+  → feedback: main_buf[idx] += fb * decay
+```
+
+Spring sizes @ 48 kHz, picked for inter-spring beating:
+
+| Spring | Main delay | Allpass sizes |
+|---|---|---|
+| A | 44 ms (2112 smp) | 89, 113, 157 |
+| B | 61 ms (2928 smp) | 97, 127, 179 |
+| C | 72 ms (3456 smp) | 101, 139, 197 |
+
+**Cross-coupling**: each spring receives a sample tapped from the previous
+spring's midpoint (~half the main delay back), scaled by `kXcoupling = 0.25`:
+
+```
+A_in = drive + C_midpoint * 0.25
+B_in = drive + A_midpoint * 0.25
+C_in = drive + B_midpoint * 0.25
+```
+
+The 0.25 cross-coupling gain is the stability ceiling — higher values let
+the A→B→C→A loop self-oscillate. Midpoints are snapshotted before any writes
+so the read order doesn't matter.
+
+**Input chain**: 5 ms pre-delay (240 samples — physical tank travel time
+before first reflection) → 1-pole LPF at 5 kHz (springs can't transmit highs).
+
+**Output mix**: `outL = 0.5·(a+b)`, `outR = 0.5·(b+c)` — B in both channels
+anchors the centre while A and C provide the inter-spring beating in the
+L/R image.
+
+**Decay** is shared across all three springs (KNOB_4 in SDD-555 mode, mapped
+0–0.95). Above 0.95 the feedback loops self-oscillate due to cross-coupling.
+
+## SDD-555 NlVerb — AMS gated + Wildcard Resonator
+
+`nl_verb.h` — one struct that hosts two algorithms because only one runs at
+a time (SW3 in the SDD-555 control map). SW3 DOWN bypasses NlVerb entirely
+and uses `SpringReverb` instead. Memory: ~10 KB SRAM.
+
+### `ProcessAms` — AMS RMX16 Non-Linear gated reverb
+
+The Phil Collins "In the Air Tonight" gated drum sound. Architecture:
+
+```
+in → peak envelope follower (1 ms attack / 50 ms release)
+   → rising-edge trigger → re-arm gate_counter
+   → 6 series allpass filters (sizes 89/127/181/257/353/467 samples, g=0.65)
+   → tap_l = output after AP3   (mid-chain — stereo decorrelation)
+   → tap_r = output after AP6   (final diffusion)
+   → gate envelope (1.0 while counter > 240 smp, linear fade to 0 in last 5 ms)
+   → outL = tap_l * gate / outR = tap_r * gate
+```
+
+The "tail" is the diffusion itself, abruptly cut. No long feedback decay.
+Default gate window is 200 ms; `SetGateMs()` can change it. Trigger threshold
+`kAmsThresh = 0.05` (~−26 dB) is permissive enough to fire on single guitar
+notes; on percussive material it gates per-transient.
+
+The 5 ms linear fade at gate-close prevents the click that a hard cut would
+produce — without it the gate sounds broken on busy material.
+
+### `ProcessWildcard` — A2-harmonic resonator
+
+Five parallel comb filters tuned to harmonics of A2 (110 Hz). Delay sizes
+are `round(48000 / (110 × n))` for n = 1..5:
+
+| Comb | Period (smp) | Frequency |
+|---|---|---|
+| 1 | 436 | 110 Hz (A2 fundamental) |
+| 2 | 218 | 220 Hz (A3) |
+| 3 | 145 | 330 Hz (E4) |
+| 4 | 109 | 440 Hz (A4) |
+| 5 |  87 | 552 Hz (~C#5) |
+
+At high `decay` (KNOB_4) the combs ring at their tuned frequencies, producing
+a droning reverb that emphasises notes in A minor / C major. Below ~0.6 it
+behaves as a more conventional comb-bank reverb.
+
+Stereo split via harmonic class: odd harmonics (110/330/550 Hz) sum into L
+at 1/3 each, even harmonics (220/440 Hz) sum into R at 1/2 each. The asymmetric
+split intentionally — gives a noticeably different timbre per channel.
+
+## SDD-555 drive levels (SW1)
+
+Like DMM, all three positions use the same compander — only the preamp gain
+into the NE570 differs. Higher drive → more polynomial dirt at the same RMS.
+
+| SW1 | Mode | `sdd_drive` | Character |
+|---|---|---|---|
+| UP | Hot | 4.0× | Heavy NE570 pumping, polynomial dirt prominent |
+| MID | Warm | 2.0× | Nominal SRE-555 operating point |
+| DOWN | Clean | 1.0× | Minimal coloration, dynamics-driven dirt only |
+
+## SDD-555 control map
+
+| Control | Identifier | Function |
+|---|---|---|
+| Knob 1 | `KNOB_1` | MORPH: Chorus → +Spring → +Verb (Phase 7) |
+| Knob 2 | `KNOB_2` | Chorus rate 0.1–3 Hz (or Eventide pre-delay, Phase 4) |
+| Knob 3 | `KNOB_3` | Chorus depth 0–100% (or detune cents, Phase 4) |
+| Knob 4 | `KNOB_4` | Spring decay (Phase 5) |
+| Knob 5 | `KNOB_5` | Mechanical age — wow depth + HF rolloff (Phase 7) |
+| Knob 6 | `KNOB_6` | Dry/wet mix |
+| Toggle 1 | `TOGGLESWITCH_1` | Input drive: UP=Hot / MID=Warm / DOWN=Clean |
+| Toggle 2 | `TOGGLESWITCH_2` | Chorus type: UP=BBD / MID=Eventide / DOWN=Dimension D (Phase 4) |
+| Toggle 3 | `TOGGLESWITCH_3` | Verb: UP=AMS Non-Lin / MID=Wildcard / DOWN=Spring only (Phase 5–6) |
+| Footswitch 2 | `FOOTSWITCH_2` | Bypass (LED 2) |
+| Footswitch 1 | `FOOTSWITCH_1` | Tap tempo → chorus rate sync (Phase 7) |
+
+Knobs not yet wired (per-phase) read 0 in SDD-555 mode — they don't affect
+audio until their owning phase is implemented.
+
+## SDD-555 memory budget
+
+Current usage (Phase 6 complete): **SRAM 139 KB / 512 KB (27%)**, **FLASH 109 KB / 128 KB (83%)**.
+
+| Object | Location | Approx size |
+|--------|----------|-------------|
+| `SpringReverb` (3 spring lines + 9 allpasses + pre-delay) | SRAM | ~40 KB |
+| `NlVerb` (6 AMS allpasses + 5 Wildcard combs + state) | SRAM | ~10 KB |
+| `BbdChorus` (one mono delay line + state) | SRAM | ~9.7 KB |
+| `Ne570` × 3 instances (compressor + L/R expanders) | SRAM | ~72 B |
+| Existing DMM objects (`DmmChain`, `PlateReverb`, etc.) | SRAM | ~79 KB |
+| `pitch` PitchShifter (shared between DMM shimmer & SDD-555 Eventide) | SDRAM | ~128 KB |
+| `delay_line` (shared mono delay, DMM only) | SDRAM | ~384 KB |
+
+**Flash headroom is healthy after Phase 6**: 83% (19 KB free). Phase 7 (MORPH
+lerp table + MechAge inline + tap-tempo wire-up) adds only small inline
+state, no new files — should land at ≤85% FLASH.
+
 ## CPU budget
 
-At 48 kHz / 480 MHz this chain runs well within budget. `PitchShifter` in the
-shimmer loop is the most expensive single element. Do NOT add FFT pitch
-shifters, additional reverbs, or loopers without profiling first.
+At 48 kHz / 480 MHz both chains run comfortably within budget. `PitchShifter`
+in the DMM shimmer loop is the most expensive single element; it's re-used
+by SDD-555's Eventide chorus mode in Phase 4 (the two modes never run
+simultaneously). Do NOT add FFT pitch shifters, additional reverbs, or
+loopers without profiling first.
 
 ## Future extensions (flagged TODOs in code)
 
-- `PitchShifter` transposition: currently +12 semitones (octave). A second
+- `PitchShifter` transposition: DMM uses +12 semitones (octave). A second
   interval (+7, perfect 5th) is a natural extension — KNOB_4 upper range could
   split into interval selection when shimmer toggle is active.
 - Expression pedal input on HotHouse maps well to MORPH for real-time
-  foot-controlled morphing.
+  foot-controlled morphing — applies to both modes.
 - The three drive levels (High/Med/Low) could expose a fourth "Fuzz" position
-  via a long-press on FS1 — `preamp_gain` ≥ 10, post_gain scaled down.
+  via a long-press on FS1 — `preamp_gain` ≥ 10, post_gain scaled down (DMM only).

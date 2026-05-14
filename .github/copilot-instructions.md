@@ -7,9 +7,17 @@ hardware platform. The HotHouse carries an **Electrosmith Daisy Seed**
 (STM32H750 ARM Cortex-M7) and provides 6 analog knobs, 3 three-position toggle
 switches, 2 footswitches, and 2 LEDs in a 125B guitar pedal enclosure.
 
-The effect is a Chase Bliss–inspired morphable chain: Deluxe Memory Man
-preamp/compander → BBD delay → ambient shimmer reverb, all swept by a single
-MORPH macro knob. Current branch: `dmm-deep-dive`.
+Two complete instruments share one binary, selectable at runtime via a hidden
+FS1+FS2 footswitch combo (3-second hold with all toggles DOWN and Mix dry):
+
+1. **DMM mode** (boot default) — Chase Bliss–inspired morphable chain:
+   Deluxe Memory Man preamp/compander → BBD delay → ambient shimmer reverb,
+   swept by a single MORPH macro knob.
+2. **SDD-555 mode** — Roland SRE-555 Chorus Echo + SDD-320 Dimension D model:
+   NE570 VCA compander → BBD chorus → 3-spring tank → AMS Non-Lin / Wildcard verb.
+   Built up in phases — see AGENTS.md for the per-phase status.
+
+Current branch: `dmm-deep-dive`.
 
 ## Build
 
@@ -66,13 +74,24 @@ grain crossfades cancel → shimmer cuts out. `tanhf` is only permitted at the
 
 ```
 src/hothouse.h / hothouse.cpp      — HotHouse hardware proxy (do not modify)
-src/MemoryMorph/memory_morph.cpp   — top-level DSP + control logic (~700 lines)
-src/MemoryMorph/morph.h            — MorphParams struct + ComputeMorph() interpolation
-src/MemoryMorph/plate_reverb.h     — PlateReverb struct (Schroeder mono-in/stereo-out)
-src/MemoryMorph/dmm_chain.h        — DmmChain struct (SA571 compander + BBD/biquad filters)
+src/MemoryMorph/memory_morph.cpp   — top-level DSP + control logic; mode dispatcher
+src/MemoryMorph/morph.h            — MorphParams + ComputeMorph() interpolation (DMM)
+src/MemoryMorph/plate_reverb.h     — PlateReverb (Schroeder mono-in/stereo-out, DMM)
+src/MemoryMorph/dmm_chain.h        — DmmChain (SA571 compander + BBD filters, DMM)
+src/MemoryMorph/tap_tempo.h        — TapTempoState (FS1 tap/freeze state machine, shared)
+src/MemoryMorph/shimmer.h          — ShimmerVoice (HPF + PitchShifter + auto-duck, DMM)
+src/MemoryMorph/ne570.h            — Ne570 VCA compander with even-order dirt (SDD-555)
+src/MemoryMorph/bbd_chorus.h       — BBD / Eventide / Dimension D chorus (SDD-555)
+src/MemoryMorph/spring_reverb.h    — 3-spring Accutronics 8AB2D1A tank (SDD-555)
+src/MemoryMorph/nl_verb.h          — AMS Non-Lin gated + Wildcard Resonator (SDD-555)
 DaisySP/                            — git submodule, do not modify
 libDaisy/                           — git submodule, do not modify
 ```
+
+Each `.h` in `src/MemoryMorph/` is a self-contained DSP struct with
+`Init(sr)` / `Reset()` / inline per-sample methods. `memory_morph.cpp` is
+pure glue: mode dispatch, parameter wiring, LED logic, two per-sample audio
+loops. Full SDD-555 spec (signal chain, constants, control map) lives in `AGENTS.md`.
 
 ## Hardware API quick reference
 

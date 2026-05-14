@@ -5,12 +5,19 @@
 // Hardware: Daisy Seed (STM32H750 ARM Cortex-M7)
 // Sample rate: 48 kHz  |  Boost mode: 480 MHz  |  Block size: 48
 //
-// ── MORPH three-zone sweep (KNOB_1) ──────────────────────────────────────────
+// ── Two instrument modes ──────────────────────────────────────────────────────
+//   DMM     (boot default) — Electro-Harmonix Deluxe Memory Man circuit model
+//   SDD-555                — Roland SRE-555 Chorus Echo + SDD-320 Dimension D
+//
+//   Mode switch: hold FS1 + FS2 + all toggles DOWN + mix fully dry for 3 s.
+//   Both LEDs blink alternating 3× to confirm. Toggles back the same way.
+//
+// ── DMM mode: MORPH three-zone sweep (KNOB_1) ────────────────────────────────
 //   0.0  Tape    — saturated tape tone, no delay, no reverb
 //   0.5  Echo    — warm Memory Man-style echo with light saturation
 //   1.0  Ambient — modulated shimmer reverb wash
 //
-// ── Controls ─────────────────────────────────────────────────────────────────
+// ── DMM mode: Controls ───────────────────────────────────────────────────────
 //   KNOB_1  Morph        — sweeps all parameters across three zones
 //   KNOB_2  Time         — delay time 50 ms – 2000 ms (log)
 //   KNOB_3  Repeats      — delay feedback 0 – 97%
@@ -18,17 +25,28 @@
 //   KNOB_5  Tone         — LPF cutoff 4000 Hz – 18 kHz (log)
 //   KNOB_6  Mix          — dry/wet blend
 //
-//   TOGGLESWITCH_1  DMM input drive level (all modes use the same circuit model)
-//                   UP=High drive  MID=Med drive  DOWN=Low drive
-//   TOGGLESWITCH_2  Modulation type
-//                   UP=Chorus  MID=Vibrato  DOWN=Wow/Flutter
-//   TOGGLESWITCH_3  Reverb tail
-//                   UP=Short plate  MID=Long plate  DOWN=Shimmer (+1 octave)
+//   TOGGLESWITCH_1  Input drive: UP=High  MID=Med  DOWN=Low
+//   TOGGLESWITCH_2  Modulation type: UP=Chorus  MID=Vibrato  DOWN=Wow/Flutter
+//   TOGGLESWITCH_3  Reverb tail: UP=Short plate  MID=Long  DOWN=Shimmer
 //
 //   FOOTSWITCH_2  Bypass toggle    (LED_2 on = active)
-//   FOOTSWITCH_1  Tap tempo (single press, LED_1 blinks on tap)
-//                 Freeze (momentary — hold to freeze)
-//                 DFU bootloader (hold 10 s + all toggles DOWN + mix at 0)
+//   FOOTSWITCH_1  Tap tempo (short press) / Freeze (hold ≥ 1500 ms)
+//                 DFU bootloader: FS1 only, hold 10 s + all toggles DOWN + mix 0
+//
+// ── SDD-555 mode: Controls ───────────────────────────────────────────────────
+//   KNOB_1  Morph        — Chorus only → +Spring → +Verb
+//   KNOB_2  Chorus rate  — LFO Hz or Eventide pre-delay ms
+//   KNOB_3  Chorus depth — LFO swing or detune cents
+//   KNOB_4  Spring decay — spring reverb feedback
+//   KNOB_5  Mech age     — wow depth + HF rolloff
+//   KNOB_6  Mix          — dry/wet blend
+//
+//   TOGGLESWITCH_1  Input drive: UP=Hot  MID=Warm  DOWN=Clean
+//   TOGGLESWITCH_2  Chorus: UP=BBD (CE-1)  MID=Eventide pitch  DOWN=Dimension D
+//   TOGGLESWITCH_3  Verb: UP=AMS Non-Lin  MID=Wildcard Resonator  DOWN=Spring only
+//
+//   FOOTSWITCH_2  Bypass toggle    (LED_2 on = active)
+//   FOOTSWITCH_1  Tap tempo (syncs chorus rate) / Freeze
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <cmath>
@@ -40,6 +58,10 @@
 #include "dmm_chain.h"
 #include "tap_tempo.h"
 #include "shimmer.h"
+#include "ne570.h"
+#include "bbd_chorus.h"
+#include "spring_reverb.h"
+#include "nl_verb.h"
 
 using clevelandmusicco::Hothouse;
 using daisy::AudioHandle;
@@ -95,9 +117,26 @@ static Led led_freeze;  // LED_1: pulsing = freeze or mod active
 
 static volatile bool bypass = false;  // start active — LED_2 lights on boot
 
+enum class ActiveMode : uint8_t { DMM, SDD555 };
+static volatile ActiveMode active_mode = ActiveMode::DMM;
+
 static DmmChain      dmm;
 static ShimmerVoice  shimmer;
 static TapTempoState tap;
+
+// ── SDD-555 mode DSP objects ─────────────────────────────────────────────────
+// Each is built up in its own Phase. Phase 2: Ne570 compander (VCA dirt).
+// Phase 3: BBD chorus + per-channel matched expanders.
+//
+// Three Ne570 instances because the SRE-555 uses one mono compressor before
+// the BBD and one expander per stereo output of the BBD — each expander tracks
+// its own channel's envelope to undo the compression accurately on stereo material.
+static Ne570       ne570;        // pre-BBD compressor (mono)
+static Ne570       ne570_exp_l;  // post-BBD expander, L channel
+static Ne570       ne570_exp_r;  // post-BBD expander, R channel
+static BbdChorus    chorus;
+static SpringReverb spring;       // 3-spring Accutronics 8AB2D1A model
+static NlVerb       nl_verb;      // AMS Non-Lin gated + Wildcard Resonator
 
 // Smoothed delay time to avoid zipper artifacts when turning the knob
 static float smooth_delay_smp = 2400.f;  // ~50 ms default
@@ -194,13 +233,102 @@ void AudioCallback(AudioHandle::InputBuffer  in,
   const float bypass_target = bypass ? 0.f : 1.f;
 
   if (bypass && bypass_ramp < 0.0001f) {
-    // Fully settled in bypass — zero filter states so re-engage starts clean,
-    // then pass dry signal through without touching any DSP or SDRAM.
-    dmm.Reset();
-    shimmer.Reset();
+    // Fully settled in bypass — zero the active mode's filter states so
+    // re-engage starts clean, then pass dry signal through.
+    if (active_mode == ActiveMode::DMM) {
+      dmm.Reset();
+      shimmer.Reset();
+    } else {
+      ne570.Reset();
+      ne570_exp_l.Reset();
+      ne570_exp_r.Reset();
+      chorus.Reset();
+      spring.Reset();
+      nl_verb.Reset();
+    }
     for (size_t i = 0; i < size; ++i) {
       out[0][i] = in[0][i];
       out[1][i] = in[0][i];
+    }
+    return;
+  }
+
+  // Per-sample smoothing coefficient (~5 ms time constant at 48 kHz).
+  // Used by both modes' per-sample mix/parameter smoothing.
+  static constexpr float kSmooth = 0.0002f;
+
+  // ── SDD-555 mode — Phase 3: drive → compress → BBD chorus → expand ────────────
+  // Full chain (spring → verb) added in Phases 5–6. Phase 4 will add Eventide
+  // and Dimension D algorithms; for now ProcessBbd is the only chorus mode.
+  if (active_mode == ActiveMode::SDD555) {
+    // SW1 input drive — Hot / Warm / Clean preamp gain into the compander.
+    float sdd_drive;
+    if      (sw1 == Hothouse::TOGGLESWITCH_UP)     sdd_drive = 4.0f;  // Hot
+    else if (sw1 == Hothouse::TOGGLESWITCH_MIDDLE) sdd_drive = 2.0f;  // Warm
+    else                                            sdd_drive = 1.0f;  // Clean
+
+    // KNOB_2 / KNOB_3 — chorus rate / depth. Raw 0–1 values; the BBD chorus
+    // uses its own ranges, separate from p_time / p_repeats which are mapped
+    // for the DMM mode. Block-rate config is fine — trapezoidal LFO advances
+    // linearly so coefficient updates don't cause artifacts.
+    const float chorus_rate_knob = hw.GetKnobValue(Hothouse::KNOB_2);
+    const float chorus_depth_knob = hw.GetKnobValue(Hothouse::KNOB_3);
+    const float chorus_rate_hz = 0.1f + chorus_rate_knob * 2.9f;  // 0.1–3 Hz
+    chorus.SetRate(chorus_rate_hz, static_cast<float>(kSampleRate));
+    chorus.SetDepth(chorus_depth_knob);
+
+    // KNOB_4 → reverb decay 0–0.95. Same knob feeds whichever algorithm SW3
+    // selects (spring / NlVerb), so the user always has the same physical
+    // control regardless of which verb is active.
+    const float verb_decay_knob = hw.GetKnobValue(Hothouse::KNOB_4);
+    spring.SetDecay (verb_decay_knob * 0.95f);
+    nl_verb.SetDecay(verb_decay_knob * 0.95f);
+
+    static float sdd_smooth_mix = 0.f;
+
+    for (size_t i = 0; i < size; ++i) {
+      const float dry = in[0][i];
+
+      sdd_smooth_mix += kSmooth * (mix_raw - sdd_smooth_mix);
+      const float mix = sdd_smooth_mix;
+
+      if (bypass_ramp < bypass_target)
+        bypass_ramp = fminf(bypass_ramp + kBypassRampRate, bypass_target);
+      else if (bypass_ramp > bypass_target)
+        bypass_ramp = fmaxf(bypass_ramp - kBypassRampRate, bypass_target);
+
+      // dc_block → input drive → NE570 compress (mono, VCA dirt baked in).
+      float sig = dc_block.Process(dry);
+      sig = tanhf(sig * sdd_drive);
+      sig = ne570.Compress(sig);
+
+      // Chorus algorithm dispatch (SW2): UP=BBD / MID=Eventide / DOWN=Dimension D.
+      // Branch is on a block-rate constant — modern branch predictor handles
+      // this cleanly without hoisting to three separate loops.
+      float wetL, wetR;
+      if      (sw2 == Hothouse::TOGGLESWITCH_UP)     chorus.ProcessBbd       (sig, wetL, wetR);
+      else if (sw2 == Hothouse::TOGGLESWITCH_MIDDLE) chorus.ProcessEventide  (sig, wetL, wetR);
+      else                                            chorus.ProcessDimensionD(sig, wetL, wetR);
+
+      // Matched expanders per channel — each tracks its own envelope so the
+      // compander pair restores dynamics accurately on stereo BBD output.
+      const float exp_l = ne570_exp_l.Expand(wetL);
+      const float exp_r = ne570_exp_r.Expand(wetR);
+
+      // SW3 verb selection: UP=AMS Non-Lin / MID=Wildcard / DOWN=Spring.
+      // Only one reverb runs per sample — the others' state holds where it
+      // was left. Reverb send/return level is fixed at 0.5 for Phase 6;
+      // Phase 7 will MORPH-scale it so the verb fades in across the macro sweep.
+      const float verb_in = 0.5f * (exp_l + exp_r);
+      float verb_l = 0.f, verb_r = 0.f;
+      if      (sw3 == Hothouse::TOGGLESWITCH_UP)     nl_verb.ProcessAms     (verb_in, verb_l, verb_r);
+      else if (sw3 == Hothouse::TOGGLESWITCH_MIDDLE) nl_verb.ProcessWildcard(verb_in, verb_l, verb_r);
+      else                                            spring  .Process       (verb_in, verb_l, verb_r);
+      const float wet_l = exp_l + verb_l * 0.5f;
+      const float wet_r = exp_r + verb_r * 0.5f;
+
+      out[0][i] = lerpf(dry, wet_l, mix * bypass_ramp);
+      out[1][i] = lerpf(dry, wet_r, mix * bypass_ramp);
     }
     return;
   }
@@ -258,8 +386,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
   // ── Per-sample DSP loop ───────────────────────────────────────────────────────
 
-  // Per-sample smoothing coefficient (~5 ms time constant at 48 kHz)
-  static constexpr float kSmooth = 0.0002f;  // morph, mix, repeats
   static float smooth_verb_lpf = 8500.f;
 
   // ── Block-rate reverb + tone config ────────────────────────────────────────
@@ -480,6 +606,14 @@ int main() {
   // Shimmer: octave up (+12 st). TODO: perfect 5th (+7) as a future extension.
   shimmer.Init(sr, &pitch);
 
+  // SDD-555 mode DSP — Ne570 needs no Init (constants only); BbdChorus
+  // computes filter coefficients and delay-tap distances from sr. The
+  // PitchShifter is shared with DMM shimmer — chorus stores the pointer
+  // and mode-switch code re-configures transposition on entry/exit.
+  chorus.Init(sr, &pitch);
+  spring.Init(sr);
+  nl_verb.Init(sr);
+
   // ── LEDs ─────────────────────────────────────────────────────────────────────
   // Init with 1000 Hz update rate for smooth 8-bit PWM brightness.
   led_bypass.Init(hw.seed.GetPin(Hothouse::LED_2), false, 1000.f);
@@ -545,15 +679,17 @@ int main() {
       led_freeze.Update();
     }
 
-    // DFU bootloader entry — 10 second hold on FS1 with secret combo:
-    // All three toggles DOWN + mix knob at 0 (fully CCW).
-    // This prevents accidental DFU entry during normal playing.
-    static uint32_t fs1_hold_start = 0;
-    static bool     fs1_was_held   = false;
+    // ── Footswitch hold detection: mode switch + DFU ──────────────────────────────
+    static uint32_t fs1_hold_start   = 0;
+    static bool     fs1_was_held     = false;
+    static uint32_t mode_combo_start = 0;
+    static bool     mode_combo_fired = false;
+
     const bool fs1_held = hw.switches[Hothouse::FOOTSWITCH_1].Pressed();
+    const bool fs2_held = hw.switches[Hothouse::FOOTSWITCH_2].Pressed();
 
     if (fs1_held && !fs1_was_held)
-      fs1_hold_start = now;  // rising edge — start counting
+      fs1_hold_start = now;
 
     const bool toggles_down =
         hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_1) == Hothouse::TOGGLESWITCH_DOWN &&
@@ -561,7 +697,44 @@ int main() {
         hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3) == Hothouse::TOGGLESWITCH_DOWN;
     const bool mix_zero = hw.GetKnobValue(Hothouse::KNOB_6) < 0.02f;
 
-    if (fs1_held && toggles_down && mix_zero && (now - fs1_hold_start) >= 10000) {
+    // Mode switch: FS1 + FS2 + all toggles DOWN + mix dry, held 3 s.
+    // Resets on any break in the combo so accidental partial holds don't accumulate.
+    const bool mode_combo = fs1_held && fs2_held && toggles_down && mix_zero;
+    if (!mode_combo) {
+      mode_combo_start = now;
+      mode_combo_fired = false;
+    } else if (!mode_combo_fired && (now - mode_combo_start) >= 3000) {
+      mode_combo_fired = true;
+      hw.StopAudio();
+      for (int bi = 0; bi < 3; bi++) {
+        led_freeze.Set(1.f); led_bypass.Set(0.f);
+        led_freeze.Update(); led_bypass.Update();
+        System::Delay(150);
+        led_freeze.Set(0.f); led_bypass.Set(1.f);
+        led_freeze.Update(); led_bypass.Update();
+        System::Delay(150);
+      }
+      led_freeze.Set(0.f); led_bypass.Set(0.f);
+      led_freeze.Update(); led_bypass.Update();
+      tap.is_freeze = false;
+      tap.active    = false;
+      active_mode   = (active_mode == ActiveMode::DMM) ? ActiveMode::SDD555 : ActiveMode::DMM;
+      // PitchShifter is shared between DMM shimmer (+12 st octave, fun=0.3)
+      // and SDD-555 Eventide chorus (+0.20 st detune, fun=0). Reconfigure
+      // here while audio is stopped so the next StartAudio block reads clean.
+      if (active_mode == ActiveMode::SDD555) {
+        pitch.SetTransposition(0.20f);
+        pitch.SetFun(0.f);
+      } else {
+        pitch.SetTransposition(12.f);
+        pitch.SetFun(0.3f);
+      }
+      hw.StartAudio(AudioCallback);
+    }
+
+    // DFU bootloader: FS1 only (FS2 not held) + all toggles DOWN + mix dry, held 10 s.
+    // The !fs2_held guard prevents the mode-switch combo from also triggering DFU.
+    if (fs1_held && !fs2_held && toggles_down && mix_zero && (now - fs1_hold_start) >= 10000) {
       hw.StopAudio();
       hw.StopAdc();
       daisy::Led l1, l2;

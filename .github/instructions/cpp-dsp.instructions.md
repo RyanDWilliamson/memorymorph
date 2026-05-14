@@ -25,8 +25,8 @@ stack or heap. Large objects require SDRAM:
 
 ```cpp
 // Large — MUST be in SDRAM
-static DelayLine<float, 192000> DSY_SDRAM_BSS delay_line;  // 2 s @ 96 kHz
-static ReverbSc                 DSY_SDRAM_BSS reverb;
+static DelayLine<float, 96000>  DSY_SDRAM_BSS delay_line;  // 2 s @ 48 kHz
+static PitchShifter             DSY_SDRAM_BSS pitch;       // ~128 KB internal buffers
 
 // Small — internal SRAM is fine
 static Hothouse   hw;
@@ -67,9 +67,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 ```cpp
 int main() {
   hw.Init(true);  // boost = 480 MHz — required for this chain
-  hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_96KHZ);
+  hw.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
   hw.SetAudioBlockSize(48);
-  float sr = hw.AudioSampleRate();  // 96000.f
+  float sr = hw.AudioSampleRate();  // 48000.f
 
   // Init all DSP objects with sr
   reverb.Init(sr);
@@ -96,7 +96,11 @@ int main() {
       led_bypass.Set(bypass ? 0.f : 1.f);
       led_bypass.Update();
     }
-    hw.CheckResetToBootloader();  // FOOTSWITCH_1 2 s hold → DFU
+    // DFU bootloader entry: detect a 10 s hold of FS1 with all toggles DOWN
+    // and Mix at 0, then call System::ResetToBootloader() yourself. The
+    // hothouse helper `CheckResetToBootloader()` is NOT used in this project
+    // because the same FS1 footswitch already carries tap-tempo / freeze
+    // semantics; the combo gates accidental DFU entry during normal playing.
   }
 }
 ```
@@ -126,4 +130,4 @@ static void OnLongPress  (Hothouse::Switches fsw) { /* future use   */ }
 - Forgetting `DSY_SDRAM_BSS` on large buffers → hard fault at `Init()`
 - Calling `Led::Update()` inside `AudioCallback` → PWM timing corruption
 - Calling `hw.ProcessAllControls()` outside the callback → stale ADC reads
-- Using `daisysp::Chorus` at 96 kHz → only 25 ms effective delay depth
+- Using `daisysp::Chorus` at all → buffer hard-coded for 48 kHz but API is fragile; use a `DelayLine + Oscillator` LFO instead. The SDD-555 BBD chorus in `bbd_chorus.h` is the worked example.
