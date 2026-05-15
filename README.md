@@ -4,15 +4,17 @@ A morphable guitar effects firmware for the
 [Cleveland Music Co. HotHouse](https://www.clevelandmusicco.com/hothouse)
 running on the Electrosmith Daisy Seed (STM32H750, 48 kHz, 480 MHz boost mode).
 
-Two complete instruments share the same pedal — switch between them on the fly
-using a hidden footswitch combo. Boot always lands in DMM mode.
+Three presets share the same pedal — switch between them on the fly using
+hidden footswitch combos. Boot always lands in DMM mode.
 
 ## DMM mode (default)
 
 A Chase Bliss–inspired chain that models the Electro-Harmonix Deluxe Memory
-Man: SA571 compander → BBD delay (modelled MN3005) → Schroeder plate reverb
-with an optional shimmer (PitchShifter +12 st) feedback loop. **MORPH**
-(Knob 1) sweeps the whole signal chain through three sonic zones.
+Man: SA571 compander (with matched expander and a coupled noise floor that
+breathes between repeats) → BBD delay (modelled MN3005, with pre/de-emphasis
+shelves and 2nd-harmonic asymmetric soft-clip) → Schroeder plate reverb with
+an optional shimmer (PitchShifter +12 st) feedback loop. **MORPH** (Knob 1)
+sweeps the whole signal chain through three sonic zones.
 
 | Position | Character | Description |
 |---|---|---|
@@ -36,33 +38,72 @@ with an optional shimmer (PitchShifter +12 st) feedback loop. **MORPH**
 | Footswitch 1 | Tap tempo (short press) · Freeze (hold ≥ 1500 ms) · DFU (10 s hold + combo) |
 | Footswitch 2 | **Bypass** — LED 2 on = active |
 
-## SDD-555 mode
+## SDD-555 Delay mode
 
 A circuit-level model of the Roland SRE-555 Chorus Echo fused with the
 SDD-320 Dimension D: NE570 log-domain VCA compander (the "dirt source") →
-tape echo (single-tap, tap-syncable, soft-clipped feedback) → BBD-style
-chorus with trapezoidal LFO → 3-spring Accutronics tank → choice of AMS
-Non-Lin gated verb or a Wildcard Resonator verb. **MORPH** sweeps
-Echo → +Chorus → +Verb.
+multi-head tape echo (three playback heads at 0.33×/0.66×/1.0× of the user's
+echo time, multi-rate wow/flutter, +4 dB head-bump EQ, asymmetric record
+saturation) → BBD-style chorus with sine LFO → 3-spring Accutronics tank →
+choice of AMS Non-Lin gated verb or a Wildcard Resonator verb. **MORPH**
+mirrors the DMM's three-zone identity — sweeping Drive → +Echo → +Chorus/Verb.
 
-### Mode switch
+| Position | Character | Description |
+|---|---|---|
+| 0.0 | **Drive** | NE570 compander dirt only — no echo, no chorus, no verb |
+| 0.5 | **Echo** | Tape echo with light chorus motion and a touch of verb |
+| 1.0 | **Ambient** | Full chorus depth + full verb wash on the echo |
 
-Hold **FS1 + FS2** while all three toggles are DOWN and the Mix knob is
-fully dry for **3 seconds**. Both LEDs blink alternately 3× to confirm.
-Toggle back to DMM the same way.
+## SDD-555 Chorus Verb mode
+
+The SDD-555 chain with the tape echo stage skipped — straight NE570 dirt
+into BBD/H910/Dimension chorus, then 3-spring tank or AMS/Wildcard verb.
+**MORPH** sweeps Drive → +Chorus → +Verb.
+
+| Position | Character | Description |
+|---|---|---|
+| 0.0 | **Drive** | NE570 compander dirt only — no chorus, no verb |
+| 0.5 | **Chorus** | Full chorus character (BBD / H910 / Dimension D), no verb |
+| 1.0 | **Verb** | Full chorus + full verb wash |
+
+### Chorus Verb controls (knobs that differ from Delay mode)
+
+| Control | Function |
+|---|---|
+| Knob 2 | **Chorus rate** — 0.1–3 Hz log (tap-synced via FS1) |
+| Knob 3 | **Chorus depth** — 0–1 LFO swing intensity (direct, not morphed) |
+| Footswitch 1 | Tap tempo (syncs chorus rate) · Freeze (hold ≥ 1500 ms) |
+
+(KNOB_1 Morph, KNOB_4 Verb decay, KNOB_5 Mech age and KNOB_6 Mix behave the
+same as in Delay mode.)
+
+### Mode switch combos
+
+Each combo is a direct toggle with DMM. Hold **FS1 + FS2** with Mix fully
+dry for **3 seconds**; both LEDs blink alternately 3× to confirm.
+
+| Target preset | Toggle pattern |
+|---|---|
+| **SDD-555 Delay** | SW1 **UP**, SW2 **DOWN**, SW3 **DOWN** |
+| **SDD-555 Chorus Verb** | SW1 **DOWN**, SW2 **UP**, SW3 **DOWN** |
+
+From either SDD-555 preset, the matching combo returns to DMM. To swap
+directly between Delay and Chorus Verb, route through DMM (hit one combo,
+then the other). The all-toggles-DOWN pattern is reserved for the 10 s DFU
+bootloader hold with FS1 only.
 
 ### SDD-555 controls
 
 | Control | Function |
 |---|---|
-| Knob 1 | **Morph** — Echo only → +Chorus → +Verb |
+| Knob 1 | **Morph** — Drive → +Echo → +Chorus/Verb (DMM-style three-zone sweep) |
 | Knob 2 | Tape echo time 50 ms – 500 ms log (authentic SRE-555 range, tap-synced via FS1) |
 | Knob 3 | Tape echo feedback / repeats |
 | Knob 4 | Verb decay (whichever verb SW3 selects) |
 | Knob 5 | Mechanical age — HF rolloff + breathing LFO |
 | Knob 6 | **Mix** — dry/wet blend |
 | Toggle 1 | NE570 drive (linear, no preamp clip): ↑ Hot · — Warm · ↓ Clean |
-| Toggle 2 | Chorus type: ↑ BBD (CE-1) · — Eventide pitch · ↓ Dimension D |
+| Toggle 2 | Chorus: ↑ CE-1 BBD (0.5 Hz, modest swing) · — H910 Micropitch (+7c, 20 ms) · ↓ Dimension D ("buttons 1+4" widest) |
 | Toggle 3 | Verb: ↑ AMS Non-Lin · — Wildcard Resonator · ↓ Spring only |
 | Footswitch 1 | Tap tempo (syncs echo time) · Freeze |
 | Footswitch 2 | **Bypass** — LED 2 on = active |

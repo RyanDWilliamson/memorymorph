@@ -7,15 +7,22 @@ hardware platform. The HotHouse carries an **Electrosmith Daisy Seed**
 (STM32H750 ARM Cortex-M7) and provides 6 analog knobs, 3 three-position toggle
 switches, 2 footswitches, and 2 LEDs in a 125B guitar pedal enclosure.
 
-Two complete instruments share one binary, selectable at runtime via a hidden
-FS1+FS2 footswitch combo (3-second hold with all toggles DOWN and Mix dry):
+Three presets share one binary, selectable at runtime via hidden FS1+FS2
+footswitch combos (3-second hold with Mix fully dry):
 
 1. **DMM mode** (boot default) — Chase Bliss–inspired morphable chain:
    Deluxe Memory Man preamp/compander → BBD delay → ambient shimmer reverb,
    swept by a single MORPH macro knob.
-2. **SDD-555 mode** — Roland SRE-555 Chorus Echo + SDD-320 Dimension D model:
-   NE570 VCA compander → BBD chorus → 3-spring tank → AMS Non-Lin / Wildcard verb.
-   Built up in phases — see AGENTS.md for the per-phase status.
+2. **SDD-555 Delay** — Roland SRE-555 Chorus Echo + SDD-320 Dimension D model:
+   NE570 VCA compander → tape echo → BBD chorus → 3-spring tank → AMS Non-Lin
+   / Wildcard verb. Combo: **SW1 UP, SW2 DOWN, SW3 DOWN**.
+3. **SDD-555 Chorus Verb** — same chain as Delay with the tape-echo stage
+   skipped: NE570 → chorus → spring/AMS/Wildcard verb. Combo: **SW1 DOWN,
+   SW2 UP, SW3 DOWN**.
+
+Each combo is a direct toggle with DMM; from either SDD-555 preset the same
+combo returns to DMM. The `ActiveMode` enum values are `DMM`, `SDD555_DELAY`,
+`SDD555_CHORUSVERB`.
 
 Current branch: `dmm-deep-dive`.
 
@@ -129,16 +136,26 @@ SW1 (drive toggle), not morphed. MORPH sweeps these parameters only:
 Wrong time constants (too small) lock the compressor at max gain → hard
 clipping → square-wave harmonics → audible 1–3 kHz drone.
 
+Time constants match the real DMM PCB's 100 µF rectifier cap, not the SA571
+datasheet "voice" setting — the slow release is what produces the audible
+noise-floor breathing between repeats.
+
 ```cpp
 // CORRECT — compute as 1 - exp(-1 / (τ_seconds × sample_rate))
-static constexpr float kCompAttack  = 0.004158f; // 5 ms  at 48 kHz
-static constexpr float kCompRelease = 0.000347f; // 60 ms at 48 kHz
+static constexpr float kCompAttack  = 0.000417f;  // 50 ms  at 48 kHz
+static constexpr float kCompRelease = 0.0000833f; // 250 ms at 48 kHz
 
 // kCompMaxGain capped at 2.0 — higher causes digital whine via sidechain HPF
 static constexpr float kCompMaxGain = 2.0f;
 // Sidechain HPF at ~164 Hz prevents 60 Hz hum from pumping compressor gain
 static constexpr float kCompHpfC    = 0.02124f;
 ```
+
+The matched expander uses the same constants — `DmmChain::Expand()` is now
+active in the DMM read path so the BBD noise floor (injected by
+`dmm.Noise()` at the BBD write point at ~-65 dBFS) gets pulled down by the
+expander between transients, producing the breathing decay that defines
+every companded BBD box.
 
 ## Footswitch behavior
 

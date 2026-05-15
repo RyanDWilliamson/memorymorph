@@ -147,17 +147,27 @@ guitar in
   → dmm.Compress() × post_gain                   — SA571 RMS 2:1 compressor (sidechain HPF at 164 Hz)
   → dmm.AaFilter()                               — 8 kHz Butterworth anti-alias before BBD
   → tone_filter (user Tone knob, 4000–18000 Hz)
+  → dmm.PreEmph()                                — +9.5 dB HF shelf at 1.5 kHz (BBD noise-reduction trick)
   → dmm.BbdFilter(c)                             — one-pole bandwidth LPF (narrows with delay time)
+  → dmm.AsymSat()                                — asymmetric soft-clip (2nd-harmonic from x² term)
   → fb_out = dmm.FbFilter(delay_line.Read())     — 5 kHz feedback warmth LPF
   → fb_sat = tanhf(fb_out × fb × 2) × 0.5       — feedback soft-clip (BBD input op-amp model)
-  → delay_line.Write(BbdFilter(input) + fb_sat)
+  → delay_line.Write(AsymSat(BbdFilter(PreEmph(input))) + dmm.Noise() + fb_sat)
+                                                  — Noise() = -65 dBFS pink-ish floor (BBD intrinsic noise)
   → delay_line.Read() → dmm.AiFilter()           — 8 kHz Butterworth anti-image reconstruction
-  → (no expander — digital has no noise floor)
+  → dmm.DeEmph()                                 — -9.5 dB HF shelf at 1.5 kHz (inverse of PreEmph)
+  → dmm.Expand()                                 — SA571 matched expander → "breathing" noise floor
   → reverb.Process()
       shimmer path: HPF(800 Hz) → PitchShifter(+12 st, fun=0.3) → × shimmer_amt → reverb input
   → tanhf(verbL) × reverb_send × 2.0            — reverb pre-clip before output mix
   → tanhf() on final output mix
 ```
+
+The PreEmph / DeEmph shelf pair around the BBD, the AsymSat 2nd-harmonic, the
+injected noise floor, and the matched Expander are the four authenticity
+additions that take the model from "clean BBD simulation" to "sounds like the
+box". Net frequency response around the BBD is unity within ±0.5 dB; the
+character lives entirely in the time-domain breathing between repeats.
 
 ## DMM drive levels (SW1)
 
@@ -180,11 +190,15 @@ differ in dynamics and harmonic character, not in volume.
 ad-hoc decimals. Wrong values cause the compressor to lock at max gain,
 producing hard clipping → square-wave harmonics → audible 1–3 kHz drone.
 
+Values match the real DMM PCB's 100 µF rectifier cap rather than the SA571
+datasheet voice setting — slower release is what produces the audible noise-
+floor breathing between repeats.
+
 ```cpp
-// Attack  ~5 ms:  1 - exp(-1 / (0.005 * 48000)) = 0.004158
-// Release ~60 ms: 1 - exp(-1 / (0.060 * 48000)) = 0.000347
-static constexpr float kCompAttack  = 0.004158f;
-static constexpr float kCompRelease = 0.000347f;
+// Attack  ~50 ms:  1 - exp(-1 / (0.050 * 48000)) ≈ 0.000417
+// Release ~250 ms: 1 - exp(-1 / (0.250 * 48000)) ≈ 0.0000833
+static constexpr float kCompAttack  = 0.000417f;
+static constexpr float kCompRelease = 0.0000833f;
 
 // kCompMaxGain is capped at 2.0 — higher values cause audible digital whine
 // when the sidechain HPF removes low-frequency content from the envelope.
@@ -195,7 +209,10 @@ static constexpr float kCompMaxGain = 2.0f;
 static constexpr float kCompHpfC    = 0.02124f;
 ```
 
-Expander uses the same time constants as the compressor (matched pair).
+Expander uses the same time constants as the compressor (matched pair). The
+expander is now active in the DMM read path so the BBD noise floor breathes
+correctly — see `DmmChain::Expand()` and the `dmm.Noise()` injection at the
+BBD write point.
 
 ## Biquad LPF coefficients (Butterworth, 8 kHz)
 
@@ -285,22 +302,57 @@ guitar in
   → lerpf(dry, wet, mix * bypass_ramp)                 — same bypass pattern as DMM
 ```
 
-### SDD-555 MORPH lerp table
+### SDD-555 MORPH lerp tables
 
-KNOB_1 in SDD-555 mode sweeps two parameters across three anchor points
-(mirroring the DMM `MorphParams` pattern, but with only two fields since the
-SDD-555 chain has fewer macro-controllable knobs). Tape echo runs at full
-level across the entire sweep — MORPH only changes how much chorus motion
-and reverb layer on top of the echo.
+Both SDD-555 presets share the `SddMorphParams` struct
+(`echo_send`, `chorus_wet`, `chorus_depth_scale`, `verb_send`) and the
+DMM-style three-zone shape. The NE570 preamp/compressor is always-on and its
+level is set by SW1 — drive is **not** morphed. `chorus_wet` crossfades the
+chorus block in/out so the Drive zone is truly clean NE570 dirt (the chorus
+EQ pair and algorithmic processing are bypassed entirely, not just LFO-zeroed).
 
-| MORPH | Zone | `verb_send` | `chorus_depth_scale` | Character |
-|---|---|---|---|---|
-| 0.0 | Echo only | 0.0 | 0.0 | Pure SRE-555 tape echo, no modulation, no verb |
-| 0.5 | Echo + Chorus | 0.3 | 1.0 | The classic "Chorus Echo" sound |
-| 1.0 | Echo + Chorus + Verb | 1.0 | 1.0 | Full ambient wash |
+**SDD555_DELAY — `ComputeDelayMorph(m)`:**
 
-Interpolation is piecewise-linear between adjacent anchors. Helper is
-`ComputeSddMorph(m)` inline in `memory_morph.cpp`.
+Echo buffer keeps writing and recirculating at every MORPH position so a
+sweep into the Echo zone doesn't reveal an empty tape.
+
+| MORPH | Zone | `echo_send` | `chorus_wet` | `chorus_depth_scale` | `verb_send` | Character |
+|---|---|---|---|---|---|---|
+| 0.0 | Drive   | 0.0 | 0.0 | 0.0 | 0.0 | NE570 dirt only, dry signal |
+| 0.5 | Echo    | 1.0 | 1.0 | 0.5 | 0.3 | Tape echo with light chorus + verb |
+| 1.0 | Ambient | 1.0 | 1.0 | 1.0 | 1.0 | Full chorus + verb wash on the echo |
+
+**SDD555_CHORUSVERB — `ComputeChorusVerbMorph(m)`:**
+
+Tape echo is skipped entirely (the per-sample `if (tape_echo)` block doesn't
+run). `echo_send` is forced to 0 across the full sweep.
+
+| MORPH | Zone | `echo_send` | `chorus_wet` | `chorus_depth_scale` | `verb_send` | Character |
+|---|---|---|---|---|---|---|
+| 0.0 | Drive  | 0.0 | 0.0 | 0.0 | 0.0 | NE570 dirt only, dry signal |
+| 0.5 | Chorus | 0.0 | 1.0 | 1.0 | 0.0 | Full chorus character, no verb |
+| 1.0 | Verb   | 0.0 | 1.0 | 1.0 | 1.0 | Full chorus + full verb wash |
+
+Interpolation is piecewise-linear between adjacent anchors in both tables.
+
+### Three-preset mode switch combos
+
+Each combo is a direct toggle with DMM. From either SDD-555 preset, the same
+combo returns to DMM. To switch directly between Delay and Chorus Verb, route
+through DMM (hit combo A, then combo B).
+
+| Combo | Target | Pattern |
+|---|---|---|
+| A | `SDD555_DELAY`      | FS1+FS2 + **SW1 UP / SW2 DOWN / SW3 DOWN** + Mix dry, held 3 s |
+| B | `SDD555_CHORUSVERB` | FS1+FS2 + **SW1 DOWN / SW2 UP / SW3 DOWN** + Mix dry, held 3 s |
+
+The all-toggles-DOWN pattern is reserved for the 10 s DFU bootloader hold
+(FS1 only, FS2 released) — each SDD-555 entry combo therefore has a unique
+toggle pattern that cannot trigger DFU or the other preset.
+
+The 3 s timer restarts whenever the combo breaks **or** the toggle pattern
+changes mid-hold to the other combo's target (so a slide between patterns
+can't accumulate time toward an unintended switch).
 
 ### MechAge (KNOB_5)
 
@@ -318,19 +370,38 @@ At age=0 the LPF cutoff sits at 18 kHz (effectively transparent); at age=1
 it lerps down to 4 kHz with ±20% LFO modulation, giving a worn-tape feel
 without the cost of a wow delay line.
 
-### Tape echo
+### Tape echo (multi-head)
 
 `memory_morph.cpp` inline — reuses the existing SDRAM `delay_line` (mono,
 ~96000 samples = 2 s capacity) since DMM and SDD-555 never run simultaneously.
 `delay_line.Init()` is called on every mode switch to zero the previous
 mode's residue (~5 ms SDRAM write, hidden under the LED blink).
 
+Three playback heads at positions 0.33, 0.66, and 1.0 of the user's main
+echo time model the SRE-555's actual multi-head transport. Each input
+generates a triplet of taps spaced through one echo cycle, and the whole
+pattern recirculates via the longest head's feedback. The multi-tap sum
+feeds the chorus mono input, getting the tape-stage character through the
+rest of the chain. Per-block flutter (5 Hz sine) and a noise-driven slow
+drift integrator (~0.1 Hz red noise) wobble all three tap read offsets in
+unison for authentic tape transport feel. A two-LPF-difference head bump
+adds ~+4 dB at 100 Hz on the multi-head sum, modelling the playback head
+gap-loss compensation EQ. The record write is run through an asymmetric
+soft-clip (`x + α·x²` then tanh, DC-blocked) so the tape stage produces a
+fatter 2nd-harmonic-rich saturation when driven hard.
+
 ```cpp
-echo_repeat   = delay_line.Read()                       // single tap, mono
-sdd_fb_lpf_z += sdd_fb_lpf_c · (echo_repeat − sdd_fb_lpf_z)  // 6 kHz tape rolloff
-fb_sat        = tanhf(sdd_fb_lpf_z · echo_fb)            // soft-clip saturation
-delay_line.Write(sig + fb_sat)                            // feedback into write head
-sig           = sig + echo_repeat                         // dry+wet sum feeds chorus
+main_smp     = sdd_smooth_echo_smp · wf_mult                   // wow/flutter multiplier
+tap1         = delay_line.Read(main_smp · 0.33)                 // head 1 (shortest)
+tap2         = delay_line.Read(main_smp · 0.66)                 // head 2 (middle)
+tap3         = delay_line.Read(main_smp)                        // head 3 (longest, primary)
+sdd_fb_lpf_z += sdd_fb_lpf_c · (tap3 − sdd_fb_lpf_z)            // 6 kHz tape rolloff
+fb_sat        = tanhf(sdd_fb_lpf_z · echo_fb)                   // soft-clip saturation
+record_pre    = (sig + fb_sat) + kTapeAsymA · (sig + fb_sat)²   // record-stage asymmetric drive
+delay_line.Write(tanhf(record_pre − tape_asym_z))               // tape_asym_z = slow HPF for DC
+multi_head    = tap3 + 0.6·tap2 + 0.5·tap1                      // head-mix levels
+head_bumped   = multi_head + 0.6·(head_lp1_z − head_lp2_z)      // ~+4 dB at 100 Hz
+sig           = sig + head_bumped · sm.echo_send                // dry+wet sum feeds chorus
 ```
 
 #### Echo time mapping
@@ -428,22 +499,46 @@ read and how stereo is constructed.
 - **Trapezoidal LFO** (BBD + Dimension D): 20% rise / 30% hold high / 20% fall
   / 30% hold low — pitch sits still for 60% of each cycle, then ramps.
 
+All three algorithms target canonical hardware reference settings cited from
+the original service manuals:
+
+| Unit | Reference setting | Source |
+|---|---|---|
+| Boss CE-1 / JC chorus | Mode=Chorus, Intensity 12:00–1:00, unity level, below clipping | Boss CE-1 service notes |
+| Eventide H910 | Mix 25–35%, Pitch ±7 cents, Delay 15–25 ms, Feedback 0–10% | H910 hardware manual |
+| Roland Dimension D | "Buttons 1+4" (widest preset), 100% wet hardware insert, unity level | SDD-320 owner's manual |
+
+**LFO waveform:** all algorithms that use modulation now use a **sine LFO**.
+An earlier revision used a piecewise trapezoid (rise 20% / hold 30% / fall 20%
+/ hold 30%) for a "shimmer + settle" feel, but the slope discontinuities at
+the rise→hold and hold→fall corners were audible as a square / sawtooth edge
+each cycle. The real CE-1 and SDD-320 use a digital LFO that is integrated
+by the BBD clock divider — the waveform that actually drives the delay tap
+in hardware is approximately sinusoidal. Sine in our model gives the same
+smooth, classic chorus motion with no audible corner artefact.
+
 **SW2 UP — `ProcessBbd` (Roland CE-1 / SRE-555):**
 
-Full trapezoidal LFO depth, two read taps with 180° phase offset, per-channel
-de-emphasis. This is the canonical "chorus" character — pronounced shimmer
-with the LFO's flat-top "settle" replacing continuous sine warble.
+BBD center ~7.5 ms (MN3002-accurate), swing ±4 ms (the "intensity 12:00–1:00"
+target — chewy but not seasick). LFO rate fixed at 0.5 Hz (CE-1 internal),
+sine shape. Two read taps at 180° phase offset, per-channel de-emphasis.
 
 **SW2 MID — `ProcessEventide` (Eventide H910 Micropitch):**
 
-No LFO modulation. Two static short reads (~6 ms L, ~10 ms R) for stereo
-decorrelation, then both channels mixed with the shared SDRAM PitchShifter's
-mono output at +0.20 st (~20 cents detune). The detune IS the chorus motion.
+No LFO modulation — the pitch shift IS the motion. 20 ms pre-delay tap feeds
+the shared SDRAM PitchShifter at **+0.20 st (≈+12 cents)**. The H910 manual
+reference is the ±7c dual-shifter "micro-pitch" sound, but with our single
+shared shifter at +0.07 st the effect was inaudible on guitar input — bumped
+to +0.20 st to register as a clearly audible micro-pitch widening while still
+being subtler than a chorus. L channel = **50% wet** pitched, R channel = 50%
+wet 20 ms-delayed dry; the two together stand in for the H910's classic ±7c
+dual image (the -7c side is approximated by the delayed dry tap on R).
+Feedback is 0 per the manual reference.
 
 **SW2 DOWN — `ProcessDimensionD` (Roland SDD-320):**
 
-Half-swing trapezoidal LFO (~50% of CE-1 depth — subtler), then cross-channel
-HPF subtraction with polarity inversion:
+Full-swing sine LFO at 0.3 Hz (SDD-320 internal "Buttons 1+4" — the widest
+hardware preset), then cross-channel HPF subtraction with polarity inversion:
 
 ```
 outL = wetL − HPF(wetR)
@@ -451,8 +546,9 @@ outR = wetR − HPF(wetL)
 ```
 
 HPF cutoff 800 Hz, 1-pole. The minus sign cancels low-frequency cross-talk
-and reinforces highs — "wider than stereo" without audible modulation.
-`xfeed_c = 1 - exp(-2π · 800 / sr)`.
+and reinforces highs — wide and glassy without audible modulation.
+`xfeed_c = 1 - exp(-2π · 800 / sr)`. The morph-level send governs the 100%
+wet ratio; at MORPH=1 the cross-channel image is at full depth.
 
 ## SDD-555 spring reverb (Accutronics 8AB2D1A)
 
@@ -479,20 +575,33 @@ Spring sizes @ 48 kHz, picked for inter-spring beating:
 | C | 72 ms (3456 smp) | 101, 139, 197 |
 
 **Cross-coupling**: each spring receives a sample tapped from the previous
-spring's midpoint (~half the main delay back), scaled by `kXcoupling = 0.25`:
+spring's midpoint (~half the main delay back), scaled by `kXcoupling = 0.18`:
 
 ```
-A_in = drive + C_midpoint * 0.25
-B_in = drive + A_midpoint * 0.25
-C_in = drive + B_midpoint * 0.25
+A_in = drive + C_midpoint * 0.18
+B_in = drive + A_midpoint * 0.18
+C_in = drive + B_midpoint * 0.18
 ```
 
-The 0.25 cross-coupling gain is the stability ceiling — higher values let
-the A→B→C→A loop self-oscillate. Midpoints are snapshotted before any writes
-so the read order doesn't matter.
+Originally 0.25, lowered to 0.18 for stability at high decay (with the new
+dispersive input chain adding latency to the composite loop, 0.25 was too
+hot). Midpoints are snapshotted before any writes so the read order doesn't
+matter.
 
-**Input chain**: 5 ms pre-delay (240 samples — physical tank travel time
-before first reflection) → 1-pole LPF at 5 kHz (springs can't transmit highs).
+**Spring-specific decay cap**: `spring.SetDecay(KNOB_4 * 0.65f)` — much lower
+than `nl_verb`'s 0.85 cap because the cross-coupled 3-spring tank has a much
+longer composite feedback path (4 dispersive APs + 3 main delays + 9 internal
+APs all in the loop). 0.65 still feels like an "endless" spring tail at
+KNOB_4=1, with zero self-oscillation at extremes.
+
+**Input chain (dispersive)**: 5 ms pre-delay → 1-pole LPF at **7 kHz** (raised
+from 5 kHz so the boing chirp has high-end to live in) → **4 cascaded Schroeder
+allpass filters** at sizes 89/157/211/257 samples, g=0.7. Total chain length
+714 samples ≈ 15 ms. This is what generates the descending "BOING" chirp on
+transients — real spring steel has frequency-dependent propagation velocity
+(high frequencies arrive first), and a cascade of strong allpass filters
+approximates that group-delay-vs-frequency curve cheaply. Without this chain,
+each spring is just a damped comb-filtered delay — present but not "springy".
 
 **Output mix**: `outL = 0.5·(a+b)`, `outR = 0.5·(b+c)` — B in both channels
 anchors the centre while A and C provide the inter-spring beating in the
@@ -500,6 +609,38 @@ L/R image.
 
 **Decay** is shared across all three springs (KNOB_4 in SDD-555 mode, mapped
 0–0.95). Above 0.95 the feedback loops self-oscillate due to cross-coupling.
+
+## SDD-555 robustness — bypass quiescing and verb headroom
+
+Two hardening passes after the third preset (Chorus Verb) landed:
+
+**Silent bypass.** LED PWM frequency is initialised at **8 kHz** (was 1 kHz)
+in `main()` so any GPIO-borne coupling into the analog input is above the
+audio band and the input LPF. The bypass settled early-return inside
+`AudioCallback` calls `dmm.Reset()` / `ne570.Reset()` / `chorus.Reset()` etc.
+**exactly once** on bypass entry via a `bypass_state_reset` latch — previously
+those Reset bursts ran every block (1 kHz of memory-store activity) and were
+audible as a low-level periodic noise. The latch clears as soon as the bypass
+ramp leaves zero. `bypass_ramp` is also snapped to `0.f` inside the
+early-return so float rounding can't keep the early-return from firing.
+
+**Verb runaway / shutoff.** The SDD-555 wet path used to be an unguarded
+sum (`aged + verb * verb_send`) with verb decay capped at `0.95` — high MORPH
++ high KNOB_4 could push the spring tank or `nl_verb` into runaway and lock
+the audio path with non-finite samples. Three changes restore musical
+behaviour at extremes:
+
+1. **Decay cap lowered to 0.85** for both `spring.SetDecay()` and
+   `nl_verb.SetDecay()` (was 0.95). 0.85 stays well clear of self-oscillation
+   while still feeling like an infinite tail at top settings.
+2. **NaN/inf guard + soft tanh saturation** on the wet sum. Mirrors the DMM
+   output stage. Pre/post gain (×0.85 / ×1.176) gives unity in the linear
+   region — musical settings are sonically unchanged; only signals above
+   ~−2 dBFS get a 2nd/3rd-harmonic compression rather than digital clip.
+3. **Emergency Reset latch** — if `|verb_l|` or `|verb_r|` ever exceeds 4.0
+   per sample, `spring.Reset()` / `nl_verb.Reset()` is called and the verb
+   output is zeroed. With the 0.85 cap this should never fire under normal
+   playing; it's a final fallback against external NaN injection.
 
 ## SDD-555 NlVerb — AMS gated + Wildcard Resonator
 
@@ -572,21 +713,26 @@ The `tanhf` preamp model belongs to DMM (NJM4558 character).
 
 | Control | Identifier | Function |
 |---|---|---|
-| Knob 1 | `KNOB_1` | MORPH: Echo → +Chorus → +Verb |
-| Knob 2 | `KNOB_2` | Tape echo time 50–500 ms log — authentic SRE-555 range (tap-synced) |
-| Knob 3 | `KNOB_3` | Tape echo feedback 0 – 0.95 |
-| Knob 4 | `KNOB_4` | Verb decay — feeds whichever verb SW3 selects |
+| Knob 1 | `KNOB_1` | MORPH: Drive → +Echo → +Chorus/Verb (DMM-style three-zone) |
+| Knob 2 | `KNOB_2` | **Delay**: tape echo time 50–500 ms log (tap-synced) · **ChorusVerb**: chorus rate 0.1–3 Hz log (tap-synced) |
+| Knob 3 | `KNOB_3` | **Delay**: tape echo feedback 0–0.95 · **ChorusVerb**: chorus depth 0–1 (direct, not morphed) |
+| Knob 4 | `KNOB_4` | Verb decay — capped at 0.85 internally to stay below the runaway knee |
 | Knob 5 | `KNOB_5` | Mechanical age — HF rolloff + breathing LFO |
 | Knob 6 | `KNOB_6` | Dry/wet mix |
 | Toggle 1 | `TOGGLESWITCH_1` | Input drive: UP=Hot / MID=Warm / DOWN=Clean |
 | Toggle 2 | `TOGGLESWITCH_2` | Chorus type: UP=BBD / MID=Eventide / DOWN=Dimension D |
 | Toggle 3 | `TOGGLESWITCH_3` | Verb: UP=AMS Non-Lin / MID=Wildcard / DOWN=Spring only |
 | Footswitch 2 | `FOOTSWITCH_2` | Bypass (LED 2) |
-| Footswitch 1 | `FOOTSWITCH_1` | Tap tempo → echo time sync · Freeze (hold ≥ 1500 ms) |
+| Footswitch 1 | `FOOTSWITCH_1` | Tap tempo (Delay → echo time, ChorusVerb → chorus rate) · Freeze (hold ≥ 1500 ms) |
 
 ## SDD-555 memory budget
 
-Current usage (Phase 7 complete): **SRAM 139 KB / 512 KB (27%)**, **FLASH 109 KB / 128 KB (83%)**.
+Current usage (Phase 7 + authenticity pass complete): **SRAM 140 KB / 512 KB (27%)**, **FLASH 111 KB / 128 KB (85%)**.
+
+The authenticity pass added ~+976 B FLASH and ~+56 B SRAM total: DMM
+pre/de-emphasis + asymmetric BBD saturation + slower compander timing +
+coupled noise floor + matched expander; SRE-555 multi-head tape echo +
+multi-rate flutter + head-bump EQ + asymmetric tape record saturation.
 
 | Object | Location | Approx size |
 |--------|----------|-------------|
