@@ -142,6 +142,13 @@ static Led led_freeze;  // LED_1: pulsing = freeze or mod active
 
 static volatile bool bypass = false;  // start active — LED_2 lights on boot
 
+// Fuzz drive override — DMM only. Toggled by FS1 double-press. When true AND
+// SW1 is UP, the preamp gain ramps up to ~30× with a lower post_gain so the
+// JRC4558 tanhf model saturates well past Hot territory into bona-fide fuzz.
+// Other SW1 positions are unaffected. State is RAM-only (not persisted across
+// reboots) — power-cycle returns to Hot.
+static volatile bool fuzz_enabled = false;
+
 // Three presets share one binary:
 //   DMM                — boot default. NJM4558 preamp → SA571 → BBD → plate/shimmer.
 //   SDD555_DELAY       — NE570 → tape echo → chorus → spring → AMS/Wildcard verb.
@@ -179,6 +186,14 @@ static NlVerb       nl_verb;      // AMS Non-Lin gated + Wildcard Resonator
 static float mech_lpf_z_l   = 0.f;
 static float mech_lpf_z_r   = 0.f;
 static float mech_wow_phase = 0.f;
+
+// ── DMM BBD clock drift state ────────────────────────────────────────────────
+// Slow random walk on the BBD delay time. Differentiates the long-time "Echo"
+// zone from the short-time "Tape" zone perceptually — at long delays the
+// drift makes the trailing repeats wander like an old transport, at short
+// delays it's inaudible. Block-rate update is plenty for ~0.1 Hz red noise.
+static float    dmm_drift_z    = 0.f;
+static uint32_t dmm_drift_seed = 0x12345678u;
 
 // ── SRE-555 multi-rate flutter state (tape transport realism) ────────────────
 // Real tape has at least two distinct pitch-modulation components: a fast
@@ -333,8 +348,17 @@ static void OnNormalPress(Hothouse::Switches fsw) {
   if (fsw == Hothouse::FOOTSWITCH_2) bypass = !bypass;
 }
 
-static void OnDoublePress(Hothouse::Switches /*fsw*/) {
-  // Reserved for future use
+static void OnDoublePress(Hothouse::Switches fsw) {
+  // FS1 double-press toggles fuzz drive. Works in every mode — DMM uses it as
+  // a "+12× preamp tanh" override on SW1=UP; SRE-555 modes use it as a "drive
+  // the NE570 polynomial harder" override on SW1=UP. The "clean JRC4558 input"
+  // constraint for SRE-555 still holds at every other position; fuzz is a
+  // deliberate creative override, not an authenticity claim. Tap-tempo would
+  // otherwise see the two rising edges as a too-fast tap pair, so cancel it.
+  if (fsw == Hothouse::FOOTSWITCH_1) {
+    fuzz_enabled = !fuzz_enabled;
+    tap.active   = false;
+  }
 }
 
 static void OnLongPress(Hothouse::Switches /*fsw*/) {
@@ -446,10 +470,18 @@ static void Sdd555Block(AudioHandle::InputBuffer  in,
     // the NE570's polynomial + the compressor's RMS pumping in Ne570::Compress().
     // Higher drive just pushes the NE570 harder — more polynomial coloration and
     // more compressor pumping, never square-wave saturation.
+    //
+    // FUZZ override (FS1 double-press): when SW1 is UP and fuzz_enabled, drive
+    // is cranked to 5× so the NE570 polynomial dominates and the final tanh
+    // output clip squares off — deliberate non-authentic creative mode.
     float sdd_drive;
-    if      (p.sw1 == Hothouse::TOGGLESWITCH_UP)     sdd_drive = 2.0f;  // Hot
-    else if (p.sw1 == Hothouse::TOGGLESWITCH_MIDDLE) sdd_drive = 1.0f;  // Warm
-    else                                              sdd_drive = 0.5f;  // Clean
+    if (p.sw1 == Hothouse::TOGGLESWITCH_UP) {
+      sdd_drive = fuzz_enabled ? 5.0f : 2.0f;                  // Hot or Fuzz
+    } else if (p.sw1 == Hothouse::TOGGLESWITCH_MIDDLE) {
+      sdd_drive = 1.0f;                                          // Warm
+    } else {
+      sdd_drive = 0.5f;                                          // Clean
+    }
 
     // Raw knob reads — SDD-555 mappings differ from DMM, so bypass Parameter::Process.
     // KNOB_2 has its own log curve here (50–500 ms — authentic SRE-555 range)
@@ -527,7 +559,34 @@ static void Sdd555Block(AudioHandle::InputBuffer  in,
       chorus_rate_hz     = rate_hz;
       chorus_depth_value = echo_fb_knob;   // KNOB_3 raw, 0–1
     }
-    chorus.SetRate(chorus_rate_hz, static_cast<float>(kSampleRate));
+    // ── Transport drift (advances every block in both SDD-555 presets) ─────
+    // Drift integrator runs in both presets because the chorus uses it for
+    // rate wandering; the 5 Hz flutter LFO only matters when there's tape, so
+    // its phase advance is gated on tape_echo below.
+    static constexpr float kDriftLpfC  = 0.000628f;   // ~0.1 Hz at 1 kHz block rate
+    static constexpr float kFlutterAmp = 0.0008f;
+    static constexpr float kDriftAmp   = 0.002f;
+    drift_seed = drift_seed * 1664525u + 1013904223u;
+    const float drift_white = static_cast<int32_t>(drift_seed) * (1.f / 2147483648.f);
+    drift_z += kDriftLpfC * (drift_white - drift_z);
+
+    float wf_mult = 1.f;
+    if (tape_echo) {
+      static constexpr float kFlutterHz = 5.f;
+      flutter_phase += kFlutterHz * static_cast<float>(size)
+                                  / static_cast<float>(kSampleRate);
+      if (flutter_phase >= 1.f) flutter_phase -= 1.f;
+      wf_mult = 1.f
+              + kFlutterAmp * sinf(flutter_phase * kTwoPi)
+              + kDriftAmp   * drift_z;
+    }
+
+    // Chorus BBD clock drift — ±4% slow rate wander. Audible at the long-rate
+    // CE-1 / SDD-320 settings as a "this thing has been on for years" wobble
+    // that doesn't lock perfectly to the LFO oscillator.
+    const float chorus_drift_mult = 1.f + 0.04f * drift_z;
+
+    chorus.SetRate(chorus_rate_hz * chorus_drift_mult, static_cast<float>(kSampleRate));
     chorus.SetDepth(chorus_depth_value);
 
     // Verb decay caps. nl_verb (AMS gated / Wildcard resonator) is stable up
@@ -549,30 +608,6 @@ static void Sdd555Block(AudioHandle::InputBuffer  in,
     const float mech_base_hz = lerpf(18000.f, 4000.f, mech_age_knob);
     const float mech_hz      = mech_base_hz * (1.f + mech_lfo * mech_age_knob * 0.2f);
     const float mech_c       = OnePoleCoeff(mech_hz, static_cast<float>(kSampleRate));
-
-    // ── Multi-rate flutter (advances at block rate, ~1 kHz, Delay preset only) ─
-    // Capstan/scrape flutter at ~5 Hz and a slow drift from low-pass-filtered
-    // white noise. Both feed the per-sample echo tap offsets below as a
-    // (1 + flutter + drift) multiplier. Depths picked to match real tape:
-    // ±0.08% sine flutter, ±0.2% slow drift — audible as wobble, not warble.
-    // Gated on tape_echo so the ChorusVerb preset doesn't waste cycles on
-    // unused flutter state.
-    float wf_mult = 1.f;
-    if (tape_echo) {
-      static constexpr float kFlutterHz   = 5.f;
-      static constexpr float kDriftLpfC   = 0.000628f;   // ~0.1 Hz at 1 kHz block rate
-      static constexpr float kFlutterAmp  = 0.0008f;
-      static constexpr float kDriftAmp    = 0.002f;
-      flutter_phase += kFlutterHz * static_cast<float>(size)
-                                  / static_cast<float>(kSampleRate);
-      if (flutter_phase >= 1.f) flutter_phase -= 1.f;
-      drift_seed = drift_seed * 1664525u + 1013904223u;
-      const float drift_white = static_cast<int32_t>(drift_seed) * (1.f / 2147483648.f);
-      drift_z += kDriftLpfC * (drift_white - drift_z);
-      wf_mult = 1.f
-              + kFlutterAmp * sinf(flutter_phase * kTwoPi)
-              + kDriftAmp   * drift_z;
-    }
 
     static float sdd_smooth_mix = 0.f;
 
@@ -704,8 +739,14 @@ static void DmmBlock(AudioHandle::InputBuffer  in,
                      float                     bypass_target) {
   // SW1 drive — preamp_gain feeds tanhf clip then SA571 compress; post_gain
   // compensates output level. High runs intentionally hotter than Med/Low.
+  // When SW1 is UP and fuzz_enabled is set (FS1 double-press toggle), the Hot
+  // position turns into a fourth "Fuzz" level — preamp gain pushed deep into
+  // tanh saturation for the squared-off corners of a fuzz pedal.
   float preamp_gain, post_gain;
-  if      (p.sw1 == Hothouse::TOGGLESWITCH_UP)     { preamp_gain = 12.0f; post_gain = 1.0f;  }
+  if      (p.sw1 == Hothouse::TOGGLESWITCH_UP) {
+    if (fuzz_enabled) { preamp_gain = 30.0f; post_gain = 0.55f; }
+    else              { preamp_gain = 12.0f; post_gain = 1.0f;  }
+  }
   else if (p.sw1 == Hothouse::TOGGLESWITCH_MIDDLE) { preamp_gain = 4.0f;  post_gain = 0.80f; }
   else                                              { preamp_gain = 2.0f;  post_gain = 0.80f; }
 
@@ -734,7 +775,16 @@ static void DmmBlock(AudioHandle::InputBuffer  in,
   const MorphParams mp_lfo = ComputeMorph(smooth_morph);
   mod_lfo.SetAmp(smooth_depth * mp_lfo.mod_depth_scale);
 
-  const float base_delay_smp = p.time_s * static_cast<float>(kSampleRate);
+  // Slow random drift on the BBD clock — ±0.3% red noise at block rate.
+  // Same xorshift-flavored LCG + one-pole as the SRE-555 flutter integrator.
+  // Multiplied into base_delay_smp below so the drift scales proportionally
+  // (audible at long times, vanishingly small at short).
+  dmm_drift_seed = dmm_drift_seed * 1664525u + 1013904223u;
+  const float dmm_drift_white = static_cast<int32_t>(dmm_drift_seed) * (1.f / 2147483648.f);
+  dmm_drift_z += 0.000628f * (dmm_drift_white - dmm_drift_z);
+  const float dmm_drift_mult = 1.f + 0.003f * dmm_drift_z;
+
+  const float base_delay_smp = p.time_s * static_cast<float>(kSampleRate) * dmm_drift_mult;
 
   // BBD bandwidth narrows with longer delay time — real MN3005 behaviour.
   const float bbd_cutoff = fminf(9000.f, fmaxf(2000.f, 4000.f / p.time_s));

@@ -35,18 +35,27 @@ sweeps the whole signal chain through three sonic zones.
 | Toggle 1 | Drive: ↑ High · — Med · ↓ Low |
 | Toggle 2 | Modulation type: ↑ Chorus · — Vibrato · ↓ Wow/Flutter |
 | Toggle 3 | Reverb tail: ↑ Short plate · — Long plate · ↓ Shimmer (octave up) |
-| Footswitch 1 | Tap tempo (short press) · Freeze (hold ≥ 1500 ms) · DFU (10 s hold + combo) |
+| Footswitch 1 | Tap tempo (short press) · Freeze (hold ≥ 1500 ms) · **Fuzz toggle** (double-press) · DFU (10 s hold + combo) |
 | Footswitch 2 | **Bypass** — LED 2 on = active |
+
+**Fuzz drive (DMM):** double-press FS1 while in DMM mode to toggle a fourth
+drive level on top of SW1=UP. It pushes the preamp tanh into hard saturation
+for fuzz-pedal squared corners; the other SW1 positions are unaffected. The
+toggle is RAM-only — power-cycle returns to non-fuzz Hot. A slow random drift
+on the DMM BBD clock (±0.3%, ~0.1 Hz) wanders the trailing repeats at long
+delay times, separating the Echo zone audibly from the dry Tape zone.
 
 ## SDD-555 Delay mode
 
 A circuit-level model of the Roland SRE-555 Chorus Echo fused with the
-SDD-320 Dimension D: NE570 log-domain VCA compander (the "dirt source") →
-multi-head tape echo (three playback heads at 0.33×/0.66×/1.0× of the user's
-echo time, multi-rate wow/flutter, +4 dB head-bump EQ, asymmetric record
-saturation) → BBD-style chorus with sine LFO → 3-spring Accutronics tank →
-choice of AMS Non-Lin gated verb or a Wildcard Resonator verb. **MORPH**
-mirrors the DMM's three-zone identity — sweeping Drive → +Echo → +Chorus/Verb.
+SDD-320 Dimension D: NE570 log-domain VCA compander (the "dirt source",
+with an optional **Fuzz override** via FS1 double-press) → multi-head tape
+echo (three playback heads at 0.33×/0.66×/1.0× of the user's echo time,
+multi-rate wow/flutter, +4 dB head-bump EQ, asymmetric record saturation) →
+BBD-style chorus with sine LFO and ±4% slow rate drift → 3-spring
+Accutronics tank → choice of AMS Non-Lin gated verb or a Wildcard Resonator
+verb. **MORPH** mirrors the DMM's three-zone identity — sweeping Drive →
++Echo → +Chorus/Verb.
 
 | Position | Character | Description |
 |---|---|---|
@@ -102,7 +111,7 @@ bootloader hold with FS1 only.
 | Knob 4 | Verb decay (whichever verb SW3 selects) |
 | Knob 5 | Mechanical age — HF rolloff + breathing LFO |
 | Knob 6 | **Mix** — dry/wet blend |
-| Toggle 1 | NE570 drive (linear, no preamp clip): ↑ Hot · — Warm · ↓ Clean |
+| Toggle 1 | NE570 drive (linear): ↑ Hot (double-press FS1 → **Fuzz**) · — Warm · ↓ Clean |
 | Toggle 2 | Chorus: ↑ CE-1 BBD (0.5 Hz, modest swing) · — H910 Micropitch (+7c, 20 ms) · ↓ Dimension D ("buttons 1+4" widest) |
 | Toggle 3 | Verb: ↑ AMS Non-Lin · — Wildcard Resonator · ↓ Spring only |
 | Footswitch 1 | Tap tempo (syncs echo time) · Freeze |

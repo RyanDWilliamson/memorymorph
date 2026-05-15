@@ -169,20 +169,23 @@ additions that take the model from "clean BBD simulation" to "sounds like the
 box". Net frequency response around the BBD is unity within ±0.5 dB; the
 character lives entirely in the time-domain breathing between repeats.
 
-## DMM drive levels (SW1)
+## DMM drive levels (SW1 + FS1 double-press)
 
-All three positions use the **same compander model** — only gain differs.
-Guitar volume directly controls saturation depth within each mode.
-
-All three `post_gain` values are equal — the SA571 compressor targets the same 0.25 RMS
-output in every mode, so equal `post_gain` gives matched perceived loudness. The modes
-differ in dynamics and harmonic character, not in volume.
+All positions use the **same compander model** — only gain differs. Guitar
+volume directly controls saturation depth within each level.
 
 | SW1 | Mode | `preamp_gain` | `post_gain` | Character |
 |---|---|---|---|---|
-| UP | High | 5.0× | 0.80× | Heavy compressor pumping, rich harmonics |
-| MID | Med | 2.5× | 0.80× | Nominal DMM operating point |
-| DOWN | Low | 1.2× | 0.80× | Gentle, most transparent |
+| UP | High | 12.0× | 1.0× | Heavy compressor pumping, rich harmonics |
+| UP + fuzz | **Fuzz** | 30.0× | 0.55× | Hard tanh saturation, fuzz-pedal squared corners |
+| MID | Med | 4.0× | 0.80× | Nominal DMM operating point |
+| DOWN | Low | 2.0× | 0.80× | Gentle, most transparent |
+
+**Fuzz mode** is toggled by a **FS1 double-press** while in DMM mode. It only
+takes effect when SW1 is UP — the Med/Low positions are unaffected. The
+double-press also cancels any tap-tempo that the two rising edges might have
+set (so the delay time doesn't lock to a 200-ms interval as a side effect of
+the toggle gesture). The flag is RAM-only; power-cycle returns to non-fuzz Hot.
 
 ## SA571 compander time constants (48 kHz)
 
@@ -248,7 +251,7 @@ controlled by SW1 (drive level), not morphed by the knob.
 | Toggle 2 | `TOGGLESWITCH_2` | Mod type: UP=Chorus / MID=Vibrato / DOWN=Wow |
 | Toggle 3 | `TOGGLESWITCH_3` | Reverb: UP=Short / MID=Long / DOWN=Shimmer |
 | Footswitch 2 | `FOOTSWITCH_2` | Bypass (LED 2) |
-| Footswitch 1 | `FOOTSWITCH_1` | Tap tempo short-press / Freeze hold ≥1500 ms (LED 1) |
+| Footswitch 1 | `FOOTSWITCH_1` | Tap tempo short-press / Freeze hold ≥1500 ms (LED 1) · **Double-press toggles Fuzz drive in DMM mode** |
 
 ## Mode switch (DMM ↔ SDD-555)
 
@@ -691,7 +694,7 @@ Stereo split via harmonic class: odd harmonics (110/330/550 Hz) sum into L
 at 1/3 each, even harmonics (220/440 Hz) sum into R at 1/2 each. The asymmetric
 split intentionally — gives a noticeably different timbre per channel.
 
-## SDD-555 drive levels (SW1)
+## SDD-555 drive levels (SW1 + FS1 double-press)
 
 **Linear gain only — no preamp clip.** The real SRE-555 input was a clean
 JRC4558 op-amp buffer with ~24× headroom at guitar levels; it didn't clip.
@@ -706,8 +709,24 @@ The `tanhf` preamp model belongs to DMM (NJM4558 character).
 | SW1 | Mode | `sdd_drive` | Character |
 |---|---|---|---|
 | UP | Hot | 2.0× | Pushes NE570 hard — prominent polynomial dirt + compressor pumping |
+| UP + fuzz | **Fuzz** | 5.0× | NE570 polynomial fully overdriven, downstream tanh squares it |
 | MID | Warm | 1.0× | Nominal SRE-555 operating point |
 | DOWN | Clean | 0.5× | Below NE570 target — nearly transparent, dynamics intact |
+
+**Fuzz mode** is shared with DMM — the same `fuzz_enabled` flag is toggled
+by FS1 double-press in any mode. In SDD-555 it deliberately overrides the
+"clean JRC4558 input" constraint as a creative override (not an authenticity
+claim); the other SW1 positions stay clean. RAM-only state.
+
+## SDD-555 transport drift (chorus + tape)
+
+A slow noise-driven random walk (~0.1 Hz red noise, single shared `drift_z`
+integrator) modulates the chorus LFO rate by ±4% in both Delay and ChorusVerb
+presets. At the slow CE-1 (0.5 Hz) and SDD-320 (0.3 Hz) settings this reads
+as the chorus "drifting against itself" — the wobble doesn't lock perfectly
+to the oscillator, giving a worn-transport character. The same `drift_z` also
+feeds the tape echo's wf_mult (along with the 5 Hz capstan flutter sine) when
+the Delay preset is active.
 
 ## SDD-555 control map
 
@@ -764,5 +783,11 @@ loopers without profiling first.
   split into interval selection when shimmer toggle is active.
 - Expression pedal input on HotHouse maps well to MORPH for real-time
   foot-controlled morphing — applies to both modes.
-- The three drive levels (High/Med/Low) could expose a fourth "Fuzz" position
-  via a long-press on FS1 — `preamp_gain` ≥ 10, post_gain scaled down (DMM only).
+
+## BBD clock drift (DMM)
+
+A slow noise-driven random walk (~0.1 Hz red noise, ±0.3% amplitude) is
+multiplied into `base_delay_smp` every block. At short delay times the drift
+is below audibility; at long delay times the trailing repeats wander like an
+old BBD transport, separating the "Echo" zone perceptually from the dry
+"Tape" zone. State is 8 B (one float + one uint32 LCG seed) at file scope.

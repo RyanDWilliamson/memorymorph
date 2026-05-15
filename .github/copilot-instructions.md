@@ -162,6 +162,12 @@ every companded BBD box.
 - `FOOTSWITCH_2` single press → toggle bypass (5 ms linear ramp to eliminate pop)
 - `FOOTSWITCH_1` short press → tap tempo
 - `FOOTSWITCH_1` hold ≥ 1500 ms → momentary freeze (release to exit)
+- `FOOTSWITCH_1` double-press → toggle Fuzz drive override (works in every
+  mode). DMM SW1=UP becomes preamp_gain=30 / post_gain=0.55 (vs 12 / 1.0).
+  SDD-555 SW1=UP becomes sdd_drive=5.0 (vs 2.0) — deliberately overrides
+  the otherwise-clean JRC4558 input constraint as a creative mode. The
+  double-press handler also clears `tap.active` so the two rising edges
+  don't pollute the tempo state.
 
 ## CPU budget
 
