@@ -93,6 +93,12 @@ DSP.)
 
 Output is **mono**, summed to both `out[0]`/`out[1]`.
 
+**DFU bootloader:** hold **FS1 + FS2** for ~2 s with all toggles DOWN and Mix at
+0 → both LEDs blink alternating 3× → `System::ResetToBootloader()`. The
+toggle/mix guard prevents an accidental double-stomp from entering DFU. 2 s is
+safe here because Echorec, unlike MemoryMorph, has no mode-switch combo to
+disambiguate from.
+
 ## Gain staging (ADR-0003)
 
 `in → ×G → drumSaturate() → ×(1/G) → … → mix → outputCeiling`. SW1 sets only

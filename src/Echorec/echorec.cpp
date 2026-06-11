@@ -16,6 +16,8 @@
 //   SW2  Speed range: UP=Long ×2  MID=Vintage ×1  DOWN=Short ×0.5
 //   SW3  Trail character: UP=Clean  MID=Vintage  DOWN=Dub
 //   FS2  Bypass (LED_2)   |   FS1  Tap tempo (long-hold reserved)
+//   DFU bootloader: hold FS1+FS2 ~2 s with all toggles DOWN + Mix at 0
+//                   (both LEDs blink alternating 3× to confirm)
 //
 // Gain staging: in → ×G → drum(saturate in loop) → ×(1/G) → tone → mix → ceiling.
 // No compander. Output is mono, summed to both channels.
@@ -234,5 +236,33 @@ int main() {
       led_select.Set(blink ? 1.f : 0.f);
       led_select.Update();
     }
+
+    // ── DFU bootloader entry ─────────────────────────────────────────────────
+    // Hold FS1 + FS2 together for ~2 s with all three toggles DOWN and Mix at 0.
+    // The toggle/mix guard stops an accidental double-stomp from dumping into
+    // DFU mid-song. (Echorec has no mode-switch combo to disambiguate, so a 2 s
+    // hold is safe — MemoryMorph needs 10 s only because of its combos.)
+    static uint32_t dfu_hold_start = 0;
+    static bool     dfu_was_held   = false;
+    const bool both_fs = hw.switches[Hothouse::FOOTSWITCH_1].Pressed() &&
+                         hw.switches[Hothouse::FOOTSWITCH_2].Pressed();
+    if (both_fs && !dfu_was_held) dfu_hold_start = now;   // rising edge
+    const bool toggles_down =
+        hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_1) == Hothouse::TOGGLESWITCH_DOWN &&
+        hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_2) == Hothouse::TOGGLESWITCH_DOWN &&
+        hw.GetToggleswitchPosition(Hothouse::TOGGLESWITCH_3) == Hothouse::TOGGLESWITCH_DOWN;
+    const bool mix_zero = hw.GetKnobValue(Hothouse::KNOB_6) < 0.02f;
+    if (both_fs && toggles_down && mix_zero && (now - dfu_hold_start) >= 2000) {
+      hw.StopAudio();
+      hw.StopAdc();
+      for (int i = 0; i < 3; ++i) {        // both LEDs blink alternating 3×
+        led_select.Set(1.f); led_bypass.Set(0.f); led_select.Update(); led_bypass.Update();
+        System::Delay(100);
+        led_select.Set(0.f); led_bypass.Set(1.f); led_select.Update(); led_bypass.Update();
+        System::Delay(100);
+      }
+      System::ResetToBootloader();
+    }
+    dfu_was_held = both_fs;
   }
 }
