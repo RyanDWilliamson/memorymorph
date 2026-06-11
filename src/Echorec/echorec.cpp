@@ -73,6 +73,12 @@ static float    warble_phase = 0.f;
 static float    warble_drift = 0.f;
 static uint32_t warble_seed  = 0x51EDC0DEu;
 
+// FS1 tap tempo → drum speed (sets the head-4 / full-rotation period).
+static volatile uint32_t tap_last_ms  = 0;
+static volatile float    tap_period_s = 0.f;
+static volatile bool     tap_active   = false;
+static float             last_speed_knob = -1.f;  // cancels tap when KNOB_2 moves
+
 // Toggle tables indexed by ToggleswitchPosition (UP=0, MIDDLE=1, DOWN=2).
 static constexpr float kDriveG[3]   = {8.0f, 3.0f, 1.0f};       // UP=Hot MID=Warm DOWN=Clean (G; makeup 1/G)
 static constexpr float kRangeMul[3] = {2.0f, 1.0f, 0.5f};       // UP=Long MID=Vintage DOWN=Short
@@ -92,8 +98,17 @@ static int SelectProgram(float knob01, int cur) {
 
 // ── Footswitches ──────────────────────────────────────────────────────────────
 static void OnNormalPress(Hothouse::Switches fs) {
-  if (fs == Hothouse::FOOTSWITCH_2) bypass = !bypass;
-  // TODO(FS1): tap tempo → drum speed. Long-hold reserved.
+  if (fs == Hothouse::FOOTSWITCH_2) { bypass = !bypass; return; }
+  if (fs == Hothouse::FOOTSWITCH_1) {
+    const uint32_t now = System::GetNow();
+    const uint32_t dt  = now - tap_last_ms;
+    tap_last_ms = now;
+    if (dt > 100u && dt < 2000u) {          // valid tap interval 100 ms – 2 s
+      tap_period_s = (float)dt * 0.001f;
+      tap_active   = true;
+    }
+  }
+  // FS1 long-hold reserved.
 }
 
 void AudioCallback(AudioHandle::InputBuffer  in,
@@ -122,10 +137,17 @@ void AudioCallback(AudioHandle::InputBuffer  in,
   warble_drift += 0.0015f * (rnd - warble_drift);
   const float warble = 1.f + (0.0005f + age * 0.0035f) * (sinf(warble_phase) + warble_drift);
 
-  // ── Drum length = authentic × speed × range × warble ────────────────────────
-  // TODO: tune p_speed so KNOB_2 noon lands exactly on kDrumNomSec.
-  const float speed_mul = p_speed.Process();
-  float len = kDrumNomSec * kSampleRateF * speed_mul * kRangeMul[sw2] * warble;
+  // ── Drum length: tap tempo (absolute) or KNOB_2 drum speed × range ──────────
+  // KNOB_2 noon (×1.0) = authentic ~300 ms. Turning KNOB_2 cancels an active tap.
+  const float speed_mul  = p_speed.Process();           // services the knob each block
+  const float speed_knob = hw.GetKnobValue(Hothouse::KNOB_2);
+  if (last_speed_knob < 0.f) last_speed_knob = speed_knob;
+  if (fabsf(speed_knob - last_speed_knob) > 0.03f) { tap_active = false; last_speed_knob = speed_knob; }
+
+  const float base = tap_active
+      ? (tap_period_s * kSampleRateF)                    // tapped head-4 period (absolute)
+      : (kDrumNomSec * kSampleRateF * speed_mul * kRangeMul[sw2]);
+  float len = base * warble;                             // all four taps wobble together
   if (len > (float)(kDrumMaxSmp - 2)) len = (float)(kDrumMaxSmp - 2);
   if (len < 64.f) len = 64.f;
   echo.SetLengthSmp(len);
@@ -171,8 +193,9 @@ int main() {
   hw.SetAudioBlockSize(48);
   const float sr = hw.AudioSampleRate();     // 96000.f
 
-  // Drum-speed multiplier 0.33×–2.0× (log); noon ≈ authentic. TODO: center tune.
-  p_speed.Init(hw.knobs[Hothouse::KNOB_2], 0.33f, 2.0f,  Parameter::LOGARITHMIC);
+  // Drum-speed multiplier 0.5×–2.0× (log), symmetric about unity so KNOB_2 noon
+  // = ×1.0 = authentic ~300 ms (150–600 ms at ×1 range; SW2 range scales it).
+  p_speed.Init(hw.knobs[Hothouse::KNOB_2], 0.5f, 2.0f,  Parameter::LOGARITHMIC);
   p_swell.Init(hw.knobs[Hothouse::KNOB_3], 0.f,   0.95f, Parameter::LINEAR);
   p_tone.Init (hw.knobs[Hothouse::KNOB_4], 0.f,   1.f,   Parameter::LINEAR);
   p_age.Init  (hw.knobs[Hothouse::KNOB_5], 0.f,   1.f,   Parameter::LINEAR);
