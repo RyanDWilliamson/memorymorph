@@ -83,12 +83,12 @@ DSP.)
 | **K2** | Drum speed | proportional time, noon = authentic ~300 ms; FS1 tap-syncable |
 | **K3** | Swell | regeneration amount, ≤ 0.95 |
 | **K4** | Tone | bass↔treble tilt |
-| **K5** | Age | bias detune + HF loss + wire noise + warble depth |
+| **K5** | Age | lofi: HF loss + hiss + dropouts + record grit (light warble) |
 | **K6** | Mix | dry/wet (folds in the "Echo" output level) |
-| **SW1** | Drive | Clean 1× / Warm 3× / Hot 8× — sets `G`; makeup `1/G` |
+| **SW1** | Head voicing | Normal / Octave-shimmer (+12 into feedback) / Sub (−12 to output) |
 | **SW2** | Speed range | Short ×0.5 / Vintage ×1 / Long ×2 (on the drum length) |
-| **SW3** | Trail character | Clean / Vintage / Dub (per-pass darkening + in-loop sat) |
-| **FS1** | Tap tempo (drum speed) | long-hold **reserved** (no freeze) |
+| **SW3** | Trail | Shoegaze (bright + allpass diffuse) / Vintage / Dub |
+| **FS1** | Tap tempo (drum speed) | LED_1 pulses at the tempo; long-hold **reserved** |
 | **FS2** | Bypass | LED 2 |
 
 Output is **mono**, summed to both `out[0]`/`out[1]`.
@@ -101,10 +101,11 @@ disambiguate from.
 
 ## Gain staging (ADR-0003)
 
-`in → ×G → drumSaturate() → ×(1/G) → … → mix → outputCeiling`. SW1 sets only
-`G`; makeup is computed `1/G` (no table). Unity is structural — drive changes
-character, not level. No compander, no `kOutTrim`, no send-scaling. The output
-soft-clip catches only swell-oscillation peaks.
+`in → ×G → drumSaturate() → ×(1/G) → … → mix → outputCeiling`. Drive is **fixed
+at Hot** (`G` = 8); makeup is computed `1/G` (no table). Unity is structural. No
+compander, no `kOutTrim`, no send-scaling. The output soft-clip catches only
+swell-oscillation peaks. (SW1, formerly drive, now selects head voicing — see
+ADR-0004.)
 
 ## Platform constraints (carried over)
 

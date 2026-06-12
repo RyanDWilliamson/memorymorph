@@ -57,16 +57,29 @@ _Avoid_: feedback, regen, repeats.
 **Bias**:
 The AC record-bias level, which on the real unit trades distortion against high-
 frequency content (too low → thin/distorted, too high → mushy/dark). Not a
-separate control in this model: the SW1 drive position pushes record level
-toward the hot/mushy end, and the Age control detunes bias toward the degraded,
-lossy end.
+separate control in this model: drive is fixed at Hot (pushing record level into
+the mushy end) and the Age control darkens the playback further.
 _Avoid_: bias knob.
+
+**Age**:
+The K5 "wear" control. Pushes the model toward hairy lofi: HF loss, raised tape
+hiss, intermittent amplitude **dropouts**, and harder record-stage **grit** —
+plus a *small* amount of warble. Deliberately weighted toward grit/noise over
+pitch wobble.
+_Avoid_: tone, age/wear as warble.
 
 **Warble**:
 The subtle pitch instability of the steel recording wire on the drum — gentler
-than tape wow/flutter (the wound-wire drum was prized for stability). A small
-always-on amount with more introduced by Age.
+than tape wow/flutter (the wound-wire drum was prized for stability), and kept
+deliberately light so Age reads as lofi grit, not seasickness.
 _Avoid_: wow, flutter (those name the tape-transport artifacts of the SRE-555).
+
+**Head voicing**:
+The SW1 control on the playback heads: Normal, Octave-shimmer (a +12 pitch tap
+injected into the swell feedback so the wash rises), or Sub (a −12 tap blended
+into the output to thicken). Replaces the old drive switch (drive is now fixed
+at Hot).
+_Avoid_: pitch knob, shimmer (reserve for the Octave mode specifically).
 
 **Head bump**:
 The resonant low-mid EQ rise from the playback head's magnetic response, modeled
@@ -74,7 +87,8 @@ on the head-amp stage. Shared concept with the SRE-555 tape model's playback
 head-bump.
 
 **Trail character**:
-The voicing of how repeats *degrade* (independent of Swell amount): Clean (low
-per-pass HF loss, bright trails), Vintage (authentic darkening), Dub (heavy
-darkening + extra in-loop saturation). The SW3 control.
+The SW3 voicing of how repeats *degrade* (independent of Swell amount):
+**Shoegaze** (bright trails + allpass diffusion in the feedback → blurred
+ambient wash), Vintage (authentic darkening), Dub (heavy darkening + extra
+in-loop saturation). Replaces the earlier "Clean" mode.
 _Avoid_: feedback tone.
