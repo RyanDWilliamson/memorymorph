@@ -94,7 +94,12 @@ impl TimeEngine {
         self.mode = p.time_mode;
         self.freeze = p.freeze;
 
-        let ds = MIN_DELAY_S * powf(MAX_DELAY_S / MIN_DELAY_S, p.time_time());
+        // Tap tempo overrides the knob until the knob is next moved.
+        let ds = if p.tap_delay_s > 0.0 {
+            p.tap_delay_s.clamp(MIN_DELAY_S, MAX_DELAY_S)
+        } else {
+            MIN_DELAY_S * powf(MAX_DELAY_S / MIN_DELAY_S, p.time_time())
+        };
         self.target_delay = (ds * self.fs).clamp(1.0, (self.delay.len() - 2) as f32);
 
         self.fb_target = match self.mode {

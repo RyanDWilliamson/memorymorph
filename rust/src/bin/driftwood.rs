@@ -41,6 +41,16 @@ const TIME_SAMPLES: usize = 96_000;
 /// Shimmer pitch-shifter window (SPACE engine).
 const SHIMMER_SAMPLES: usize = 2_048;
 
+// FOOTSWITCH_1 timing (delay modes): a press shorter than TAP_PRESS_MAX is a
+// tap; held past FREEZE_HOLD it becomes a momentary freeze. Valid tap intervals
+// map directly to delay time.
+const FREEZE_HOLD_MS: u32 = 350;
+const TAP_PRESS_MAX_MS: u32 = 600;
+const TAP_MIN_MS: u32 = 100;
+const TAP_MAX_MS: u32 = 1_200;
+/// Knob movement (resolved TIME-time) beyond this releases tap-tempo override.
+const KNOB_MOVE_EPS: f32 = 0.01;
+
 static AUDIO_INTERFACE: Mutex<RefCell<Option<audio::Interface>>> = Mutex::new(RefCell::new(None));
 static ENGINE: Mutex<RefCell<Option<DriftwoodEngine>>> = Mutex::new(RefCell::new(None));
 static PARAMS: Mutex<Cell<Params>> = Mutex::new(Cell::new(Params::DEFAULT));
@@ -98,6 +108,13 @@ fn main() -> ! {
     let mut heartbeat = clock.now_cycles();
     let mut bypass = true;
 
+    // FOOTSWITCH_1 tap / freeze state.
+    let mut fs1_held = false;
+    let mut fs1_press_at = clock.now_cycles();
+    let mut last_tap_at: Option<u32> = None;
+    let mut tap_delay_s = 0.0f32;
+    let mut prev_time_knob = Params::DEFAULT_KNOBS[Page::Time.index()][0];
+
     loop {
         let state = controls.read();
 
@@ -112,9 +129,20 @@ fn main() -> ! {
             bypass = !bypass;
         }
 
+        // Track FOOTSWITCH_1 press timing from the debounced edges.
+        match events[0] {
+            FootswitchEvent::Pressed => {
+                fs1_held = true;
+                fs1_press_at = clock.now_cycles();
+            }
+            FootswitchEvent::Released => fs1_held = false,
+            _ => {}
+        }
+
         // FOOTSWITCH_1 is mode-dependent (TOGGLE_2). In LOOPER it is the
-        // transport (short = record→play→overdub, hold = stop/clear); in the
-        // delay modes its hold is a momentary freeze/havoc.
+        // transport (short = record→play→overdub, hold = stop/clear). In the
+        // delay modes a short press is tap tempo and a sustained hold is a
+        // momentary freeze/havoc.
         let time_mode = TimeMode::from_toggle(state.toggles[1]);
         let mut freeze = false;
         if let TimeMode::Looper = time_mode {
@@ -131,18 +159,44 @@ fn main() -> ! {
                 });
             }
         } else {
-            freeze = state.footswitches[0];
+            if let FootswitchEvent::Released = events[0] {
+                if clock.elapsed_ms(fs1_press_at) < TAP_PRESS_MAX_MS {
+                    let now = clock.now_cycles();
+                    if let Some(prev) = last_tap_at {
+                        let interval = clock.elapsed_ms(prev);
+                        if (TAP_MIN_MS..=TAP_MAX_MS).contains(&interval) {
+                            tap_delay_s = interval as f32 / 1000.0;
+                            cortex_m::interrupt::free(|cs| {
+                                if let Some(eng) = ENGINE.borrow(cs).borrow_mut().as_mut() {
+                                    eng.tap_sync();
+                                }
+                            });
+                        }
+                    }
+                    last_tap_at = Some(now);
+                }
+            }
+            freeze = fs1_held && clock.elapsed_ms(fs1_press_at) >= FREEZE_HOLD_MS;
         }
 
         // Resolve the paged knobs (soft-takeover) and publish for the ISR.
         let page = Page::from_toggle(state.toggles[0]);
         let knobs = paged.update(page, &state.knobs);
+
+        // Moving the TIME-time knob releases the tap-tempo override.
+        let cur_time_knob = knobs[Page::Time.index()][0];
+        if (cur_time_knob - prev_time_knob).abs() > KNOB_MOVE_EPS {
+            tap_delay_s = 0.0;
+        }
+        prev_time_knob = cur_time_knob;
+
         let params = Params {
             knobs,
             time_mode,
             space_mode: SpaceMode::from_toggle(state.toggles[2]),
             bypass,
             freeze,
+            tap_delay_s,
         };
         cortex_m::interrupt::free(|cs| PARAMS.borrow(cs).set(params));
 

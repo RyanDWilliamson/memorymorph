@@ -56,11 +56,12 @@ by TOGGLE_1 with soft-takeover.
 
 - **TOGGLE_2** TIME mode: Looper / Delay / Tape-slip · **TOGGLE_3** SPACE
   character: Dark / Modulated / Shimmer.
-- **FOOTSWITCH_1** is mode-dependent: in delay modes short = tap*, hold =
-  freeze/havoc; in Looper short = record→play→overdub, hold = stop/clear.
+- **FOOTSWITCH_1** is mode-dependent: in delay modes short = tap tempo (and
+  tap-syncs the MOVEMENT LFO), hold = freeze/havoc; in Looper short =
+  record→play→overdub, hold = stop/clear. Moving the time knob releases the tap.
 - **FOOTSWITCH_2** = bypass (trails). DFU = both held + KNOB_5 dry, ~1.5 s.
 
-\* tap tempo + tap-sync and on-bench voicing are the remaining Phase-6 items.
+On-bench voicing and the CPU-budget check are the remaining Phase-6 items.
 
 **Entering DFU without opening the pedal** (mandatory firmware gesture,
 bench-verified 2026-06-27): hold **both footswitches** with the **wet/dry

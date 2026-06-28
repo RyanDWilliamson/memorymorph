@@ -19,7 +19,7 @@ the phase that introduced it is the suspect.
 | `driftwood-phase3` | `ba0cb56` | TIME engine live: delay / tape-slip / looper, freeze/havoc | Delay with varispeed glide; tape-slip drift; looper (FS1 transport); FS1-hold freeze. SPACE still pass-through. |
 | `driftwood-phase4` | `455b6b9` | SPACE engine: PT2399 reverb + shimmer + bloom (serial after TIME) | Reverb after the delay (TOGGLE_3 Dark/Modulated/Shimmer); FS1-hold blooms the reverb. |
 | `driftwood-phase5` | `6737972` | MOVEMENT wired in (tremolo / vibrato / swell) | MASTER page animates the signal per the movement target (K5). |
-| `driftwood` (tip) | latest | Docs + (next) tap tempo + bench voicing | Full pedal. |
+| `driftwood` (tip) | latest | Docs, tap tempo + tap-sync; bench voicing pending | Full pedal: tap the delay time on FS1; remaining work is on-bench voicing/CPU. |
 
 Notes:
 - The `dsp/` crate is shared, so checking out an older phase also reverts the DSP

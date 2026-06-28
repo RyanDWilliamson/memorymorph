@@ -48,6 +48,11 @@ impl DriftwoodEngine {
         self.time.looper_transport(input);
     }
 
+    /// Re-align the MOVEMENT LFO to a tap (tap-sync).
+    pub fn tap_sync(&mut self) {
+        self.movement.reset();
+    }
+
     #[inline]
     pub fn process(&mut self, x: f32, p: &Params) -> f32 {
         if p.bypass {

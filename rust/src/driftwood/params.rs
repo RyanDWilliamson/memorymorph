@@ -80,6 +80,8 @@ pub struct Params {
     pub space_mode: SpaceMode,
     pub bypass: bool,
     pub freeze: bool,
+    /// Tapped delay time in seconds; `0.0` means "use the TIME knob".
+    pub tap_delay_s: f32,
 }
 
 impl Params {
@@ -99,6 +101,7 @@ impl Params {
         space_mode: SpaceMode::Modulated,
         bypass: true,
         freeze: false,
+        tap_delay_s: 0.0,
     };
 
     // ── TIME page ───────────────────────────────────────────────────────────
