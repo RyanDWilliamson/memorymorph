@@ -79,14 +79,16 @@ impl SpaceEngine {
         };
     }
 
+    /// `send_gain` scales the dry signal into the tank (MOVEMENT swell, space
+    /// target); 1.0 when movement is off or targeting something else.
     #[inline]
-    pub fn process(&mut self, x: f32) -> f32 {
+    pub fn process(&mut self, x: f32, send_gain: f32) -> f32 {
         let inject = if self.shimmer_amt > 0.0 {
             self.shimmer.process(self.last_tail) * self.shimmer_amt
         } else {
             0.0
         };
-        let send = x + self.last_tail * self.regen;
+        let send = x * send_gain + self.last_tail * self.regen;
         let wet = self.reverb.process(send, inject);
         self.last_tail = wet;
         x * (1.0 - self.mix) + wet * self.mix

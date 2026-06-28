@@ -126,22 +126,24 @@ impl TimeEngine {
         }
     }
 
+    /// `vib` is an external vibrato fraction (MOVEMENT, time target); 0 when
+    /// movement is off or targeting something else.
     #[inline]
-    pub fn process(&mut self, x: f32) -> f32 {
+    pub fn process(&mut self, x: f32, vib: f32) -> f32 {
         // Varispeed glide + feedback smoothing.
         self.cur_delay += self.delay_slew * (self.target_delay - self.cur_delay);
         self.feedback += 0.002 * (self.fb_target - self.feedback);
 
         match self.mode {
             TimeMode::Looper => self.process_looper(x),
-            _ => self.process_delay(x),
+            _ => self.process_delay(x, vib),
         }
     }
 
     #[inline]
-    fn process_delay(&mut self, x: f32) -> f32 {
+    fn process_delay(&mut self, x: f32, vib: f32) -> f32 {
         let w = self.warble.process(); // [-1,1] × amount
-        let mut mod_frac = w * 0.02; // ±2% wow/flutter
+        let mut mod_frac = w * 0.02 + vib; // ±2% wow/flutter + movement vibrato
         if self.mode == TimeMode::TapeSlip {
             self.slip_phase += SLIP_DRIFT_HZ / self.fs;
             if self.slip_phase >= 1.0 {

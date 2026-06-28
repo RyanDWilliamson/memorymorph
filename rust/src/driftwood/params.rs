@@ -155,12 +155,49 @@ impl Params {
 
     // ── MASTER page (global) ────────────────────────────────────────────────
     #[inline]
+    pub fn movement_rate(&self) -> f32 {
+        self.knobs[Page::Master.index()][0]
+    }
+    #[inline]
+    pub fn movement_depth(&self) -> f32 {
+        self.knobs[Page::Master.index()][1]
+    }
+    #[inline]
+    pub fn movement_shape(&self) -> f32 {
+        self.knobs[Page::Master.index()][2]
+    }
+    #[inline]
     pub fn input_gain(&self) -> f32 {
         self.knobs[Page::Master.index()][3]
     }
     #[inline]
+    pub fn movement_target(&self) -> MoveTarget {
+        MoveTarget::from_knob(self.knobs[Page::Master.index()][4])
+    }
+    #[inline]
     pub fn output_level(&self) -> f32 {
         self.knobs[Page::Master.index()][5]
+    }
+}
+
+/// What the MOVEMENT LFO modulates (MASTER K5).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MoveTarget {
+    /// Amplitude — tremolo (or harmonic tremolo when the shape is Harmonic).
+    Amplitude,
+    /// Time — vibrato (modulates the TIME engine delay read).
+    Time,
+    /// Space — swell (modulates the SPACE reverb send).
+    Space,
+}
+
+impl MoveTarget {
+    pub fn from_knob(k: f32) -> Self {
+        match (k.clamp(0.0, 0.999) * 3.0) as u32 {
+            0 => MoveTarget::Amplitude,
+            1 => MoveTarget::Time,
+            _ => MoveTarget::Space,
+        }
     }
 }
 

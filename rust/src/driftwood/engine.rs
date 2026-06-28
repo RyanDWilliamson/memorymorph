@@ -7,6 +7,7 @@
 
 use dsp::looper::LooperInput;
 
+use super::movement_engine::MovementEngine;
 use super::params::Params;
 use super::space_engine::SpaceEngine;
 use super::time_engine::TimeEngine;
@@ -14,6 +15,7 @@ use super::time_engine::TimeEngine;
 pub struct DriftwoodEngine {
     time: TimeEngine,
     space: SpaceEngine,
+    movement: MovementEngine,
 }
 
 impl DriftwoodEngine {
@@ -31,12 +33,14 @@ impl DriftwoodEngine {
         Self {
             time: TimeEngine::new(fs, time_buf),
             space: SpaceEngine::new(fs, reverb_buf, shimmer_buf),
+            movement: MovementEngine::new(fs),
         }
     }
 
     pub fn set_params(&mut self, p: &Params) {
         self.time.set_params(p);
         self.space.set_params(p, p.freeze); // FS1-hold blooms the reverb
+        self.movement.set_params(p);
     }
 
     /// Forward a looper transport event to the TIME engine (LOOPER mode).
@@ -49,10 +53,12 @@ impl DriftwoodEngine {
         if p.bypass {
             return x; // unity dry pass-through
         }
+        self.movement.tick();
         let g_in = 0.5 + 1.5 * p.input_gain(); // ~0.5..2.0 operating point
-        let t = self.time.process(x * g_in);
-        let s = self.space.process(t);
-        soft_limit(s * p.output_level())
+        let t = self.time.process(x * g_in, self.movement.vib());
+        let s = self.space.process(t, self.movement.send_gain());
+        let out = self.movement.apply_amp(s);
+        soft_limit(out * p.output_level())
     }
 }
 
