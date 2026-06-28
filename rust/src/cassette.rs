@@ -13,6 +13,8 @@ use dsp::saturation::TapeSat;
 use dsp::tone::CassetteTone;
 use dsp::warble::Warble;
 
+use crate::delay::DelayLine;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TapeSpeed {
     Fast,
@@ -54,46 +56,6 @@ impl Params {
 impl Default for Params {
     fn default() -> Self {
         Self::DEFAULT
-    }
-}
-
-/// Circular delay line over an SDRAM-backed buffer with linear-interpolated
-/// fractional read (for the wow/flutter modulation).
-pub struct DelayLine {
-    buf: &'static mut [f32],
-    write: usize,
-}
-
-impl DelayLine {
-    pub fn new(buf: &'static mut [f32]) -> Self {
-        for s in buf.iter_mut() {
-            *s = 0.0;
-        }
-        Self { buf, write: 0 }
-    }
-
-    #[inline]
-    pub fn write(&mut self, x: f32) {
-        self.buf[self.write] = x;
-        self.write += 1;
-        if self.write >= self.buf.len() {
-            self.write = 0;
-        }
-    }
-
-    /// Read `delay` samples in the past, linearly interpolated.
-    #[inline]
-    pub fn read(&self, delay: f32) -> f32 {
-        let n = self.buf.len();
-        let d = delay.clamp(1.0, (n - 2) as f32);
-        let mut rp = self.write as f32 - d;
-        if rp < 0.0 {
-            rp += n as f32;
-        }
-        let i0 = rp as usize;
-        let frac = rp - i0 as f32;
-        let i1 = if i0 + 1 >= n { 0 } else { i0 + 1 };
-        self.buf[i0] + frac * (self.buf[i1] - self.buf[i0])
     }
 }
 

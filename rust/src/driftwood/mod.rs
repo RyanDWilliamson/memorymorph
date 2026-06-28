@@ -7,7 +7,9 @@
 pub mod engine;
 pub mod paging;
 pub mod params;
+pub mod time_engine;
 
 pub use engine::DriftwoodEngine;
 pub use paging::PagedKnobs;
 pub use params::{Page, Params, SpaceMode, TimeMode};
+pub use time_engine::TimeEngine;

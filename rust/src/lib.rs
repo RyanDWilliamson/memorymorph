@@ -17,4 +17,5 @@
 
 pub mod board;
 pub mod cassette;
+pub mod delay;
 pub mod driftwood;

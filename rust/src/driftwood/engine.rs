@@ -1,32 +1,36 @@
 //! Driftwood signal chain: `IN → [TIME engine] → [SPACE engine] → OUT`.
 //!
-//! **Phase 1 scaffold:** this is a wiring stub — clean dry pass-through with the
-//! MASTER output-level knob and true bypass, so the control surface, paging,
-//! footswitches, LEDs and DFU can be bench-verified before any DSP lands. The
-//! modeled BBD/tape TIME engine, PT2399 SPACE reverb and MOVEMENT LFO arrive in
-//! later phases and will hang off the SDRAM buffer reserved here.
+//! Phase 3: the TIME engine (BBD delay / tape-slip / looper) is live. The SPACE
+//! reverb is still a pass-through and arrives in Phase 4. Gain staging follows
+//! the plan: MASTER input-gain at the front, MASTER output-level at the back,
+//! and a waveform-preserving soft limiter protecting the codec.
+
+use dsp::looper::LooperInput;
 
 use super::params::Params;
+use super::time_engine::TimeEngine;
 
 pub struct DriftwoodEngine {
     fs: f32,
-    /// SDRAM-backed audio memory, reserved for the TIME engine's delay/loop and
-    /// the SPACE reverb network (unused in the Phase 1 scaffold).
-    buf: &'static mut [f32],
+    time: TimeEngine,
 }
 
 impl DriftwoodEngine {
     pub fn new(fs: f32, buf: &'static mut [f32]) -> Self {
-        for s in buf.iter_mut() {
-            *s = 0.0;
+        Self {
+            fs,
+            time: TimeEngine::new(fs, buf),
         }
-        Self { fs, buf }
     }
 
-    /// Re-map parameters once per audio block. (No-op in the scaffold.)
-    pub fn set_params(&mut self, _p: &Params) {
+    pub fn set_params(&mut self, p: &Params) {
         let _ = self.fs;
-        let _ = self.buf.len();
+        self.time.set_params(p);
+    }
+
+    /// Forward a looper transport event to the TIME engine (LOOPER mode).
+    pub fn looper_transport(&mut self, input: LooperInput) {
+        self.time.looper_transport(input);
     }
 
     #[inline]
@@ -34,6 +38,18 @@ impl DriftwoodEngine {
         if p.bypass {
             return x; // unity dry pass-through
         }
-        x * p.output_level()
+        let g_in = 0.5 + 1.5 * p.input_gain(); // ~0.5..2.0 operating point
+        let t = self.time.process(x * g_in);
+        // SPACE engine: pass-through until Phase 4.
+        let out = t * p.output_level();
+        soft_limit(out)
     }
+}
+
+/// Waveform-preserving soft limiter (monotonic over ±1.4) keeping the output
+/// inside the codec's range during freeze/havoc blooms.
+#[inline]
+fn soft_limit(x: f32) -> f32 {
+    let a = x.clamp(-1.4, 1.4);
+    a - (a * a * a) * (1.0 / 6.0)
 }

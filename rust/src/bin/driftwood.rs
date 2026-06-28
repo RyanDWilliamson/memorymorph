@@ -27,6 +27,7 @@ use stm32h7xx_hal::delay::Delay;
 use stm32h7xx_hal::pac::interrupt;
 
 use daisy::audio;
+use dsp::looper::LooperInput;
 use hothouse::board::{self, BootloaderGesture, Clock, Controls, FootswitchEvent, FootswitchTracker};
 use hothouse::driftwood::{DriftwoodEngine, Page, PagedKnobs, Params, SpaceMode, TimeMode};
 
@@ -100,15 +101,35 @@ fn main() -> ! {
         if let FootswitchEvent::Released = events[1] {
             bypass = !bypass;
         }
-        // FOOTSWITCH_1 hold = momentary freeze (tap tempo arrives in Phase 3).
-        let freeze = state.footswitches[0];
+
+        // FOOTSWITCH_1 is mode-dependent (TOGGLE_2). In LOOPER it is the
+        // transport (short = record→play→overdub, hold = stop/clear); in the
+        // delay modes its hold is a momentary freeze/havoc.
+        let time_mode = TimeMode::from_toggle(state.toggles[1]);
+        let mut freeze = false;
+        if let TimeMode::Looper = time_mode {
+            let cmd = match events[0] {
+                FootswitchEvent::Released => Some(LooperInput::ShortPress),
+                FootswitchEvent::LongPress => Some(LooperInput::Hold),
+                _ => None,
+            };
+            if let Some(c) = cmd {
+                cortex_m::interrupt::free(|cs| {
+                    if let Some(eng) = ENGINE.borrow(cs).borrow_mut().as_mut() {
+                        eng.looper_transport(c);
+                    }
+                });
+            }
+        } else {
+            freeze = state.footswitches[0];
+        }
 
         // Resolve the paged knobs (soft-takeover) and publish for the ISR.
         let page = Page::from_toggle(state.toggles[0]);
         let knobs = paged.update(page, &state.knobs);
         let params = Params {
             knobs,
-            time_mode: TimeMode::from_toggle(state.toggles[1]),
+            time_mode,
             space_mode: SpaceMode::from_toggle(state.toggles[2]),
             bypass,
             freeze,

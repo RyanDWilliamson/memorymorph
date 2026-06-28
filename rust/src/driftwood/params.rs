@@ -101,6 +101,32 @@ impl Params {
         freeze: false,
     };
 
+    // ── TIME page ───────────────────────────────────────────────────────────
+    #[inline]
+    pub fn time_time(&self) -> f32 {
+        self.knobs[Page::Time.index()][0]
+    }
+    #[inline]
+    pub fn time_repeats(&self) -> f32 {
+        self.knobs[Page::Time.index()][1]
+    }
+    #[inline]
+    pub fn time_warble(&self) -> f32 {
+        self.knobs[Page::Time.index()][2]
+    }
+    #[inline]
+    pub fn time_drive(&self) -> f32 {
+        self.knobs[Page::Time.index()][3]
+    }
+    #[inline]
+    pub fn time_mix(&self) -> f32 {
+        self.knobs[Page::Time.index()][4]
+    }
+    #[inline]
+    pub fn time_level(&self) -> f32 {
+        self.knobs[Page::Time.index()][5]
+    }
+
     // ── MASTER page (global) ────────────────────────────────────────────────
     #[inline]
     pub fn input_gain(&self) -> f32 {
