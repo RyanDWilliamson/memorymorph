@@ -1,0 +1,49 @@
+[workspace]
+members = ["dsp"]
+
+[package]
+name = "cassette-lofi-junky"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ryan Williamson <ryanwprod@mac.com>"]
+description = "Hothouse (Daisy Seed) pedal firmware — Cassette LoFi Junky + Driftwood"
+license = "GPL-3.0-or-later"
+
+# Shared platform library imported by every pedal binary as `hothouse`.
+# The package keeps its historical name (so `--bin cassette-lofi-junky` and the
+# Makefile are unchanged); only the lib crate is renamed for a clean import path.
+[lib]
+name = "hothouse"
+path = "src/lib.rs"
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = { version = "0.7", features = ["device"] }
+panic-halt = "0.2"
+libm = "0.2"
+# Zlosynth board-support package for the Daisy. HAL is pinned to match (0.11 -> 0.16).
+daisy = { version = "0.11", default-features = false }
+stm32h7xx-hal = { version = "0.16", features = ["stm32h750v", "rt", "revision_v"] }
+dsp = { path = "dsp" }
+
+[features]
+# Board revision is mandatory and mutually exclusive — daisy emits a compile_error
+# if none is selected. DEFAULT IS seed_1_1 (WM8731 codec); CONFIRM YOUR SEED REV on
+# the bench before trusting audio. Override with e.g.
+#   cargo build --release --no-default-features --features seed,sampling_rate_96khz
+default = ["seed_1_1", "sampling_rate_96khz"]
+
+seed = ["daisy/seed"]               # original Daisy Seed, AK4556 codec
+seed_1_1 = ["daisy/seed_1_1"]       # Daisy Seed 1.1, WM8731 codec
+seed_1_2 = ["daisy/seed_1_2"]       # Daisy Seed 1.2, PCM3060 codec
+sampling_rate_96khz = ["daisy/sampling_rate_96khz"]
+
+[profile.release]
+codegen-units = 1
+debug = true            # symbols don't cost FLASH; helpful for probe-rs
+lto = true
+opt-level = "s"         # FLASH is only 128K — optimise for size
+overflow-checks = false
+
+[profile.dev]
+opt-level = 1           # audio DSP is unusably slow at opt-level 0

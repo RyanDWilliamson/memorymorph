@@ -1,0 +1,13 @@
+# -Tlink.x comes from cortex-m-rt and pulls in the daisy BSP's memory.x (placed
+# on the link search path by the daisy crate's build script).
+# NOTE: flip-link is omitted — it double-includes this BSP's REGION_ALIAS-based
+# memory.x and fails ("redefinition of memory region 'RAM'"). Matches how the
+# daisy crate's own examples link.
+[target.thumbv7em-none-eabihf]
+runner = 'probe-rs run --chip STM32H750VBTx'
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+]
+
+[build]
+target = "thumbv7em-none-eabihf"

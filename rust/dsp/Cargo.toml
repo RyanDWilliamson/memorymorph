@@ -1,0 +1,11 @@
+[package]
+name = "dsp"
+version = "0.1.0"
+edition = "2021"
+description = "Cassette LoFi Junky DSP — no_std on target, host-testable under `cargo test`"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+# libm gives tanhf/expf in no_std and also builds on the host for tests, so the
+# DSP math is identical on both — no cfg-gated math paths.
+libm = "0.2"
