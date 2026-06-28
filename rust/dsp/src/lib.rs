@@ -11,6 +11,7 @@
 mod onepole;
 pub mod bbd;
 pub mod lofi;
+pub mod movement;
 pub mod pt2399_reverb;
 pub mod saturation;
 pub mod takeover;
