@@ -1,31 +1,42 @@
 //! Driftwood signal chain: `IN → [TIME engine] → [SPACE engine] → OUT`.
 //!
-//! Phase 3: the TIME engine (BBD delay / tape-slip / looper) is live. The SPACE
-//! reverb is still a pass-through and arrives in Phase 4. Gain staging follows
-//! the plan: MASTER input-gain at the front, MASTER output-level at the back,
-//! and a waveform-preserving soft limiter protecting the codec.
+//! Both modeled engines run in series. Gain staging follows the plan: MASTER
+//! input-gain at the front, MASTER output-level at the back, and a
+//! waveform-preserving soft limiter protecting the codec. FS1-hold freezes the
+//! TIME engine and blooms the SPACE reverb together.
 
 use dsp::looper::LooperInput;
 
 use super::params::Params;
+use super::space_engine::SpaceEngine;
 use super::time_engine::TimeEngine;
 
 pub struct DriftwoodEngine {
-    fs: f32,
     time: TimeEngine,
+    space: SpaceEngine,
 }
 
 impl DriftwoodEngine {
-    pub fn new(fs: f32, buf: &'static mut [f32]) -> Self {
+    /// SDRAM the SPACE reverb network needs (so the caller can partition).
+    pub fn reverb_len(fs: f32) -> usize {
+        SpaceEngine::reverb_len(fs)
+    }
+
+    pub fn new(
+        fs: f32,
+        time_buf: &'static mut [f32],
+        reverb_buf: &'static mut [f32],
+        shimmer_buf: &'static mut [f32],
+    ) -> Self {
         Self {
-            fs,
-            time: TimeEngine::new(fs, buf),
+            time: TimeEngine::new(fs, time_buf),
+            space: SpaceEngine::new(fs, reverb_buf, shimmer_buf),
         }
     }
 
     pub fn set_params(&mut self, p: &Params) {
-        let _ = self.fs;
         self.time.set_params(p);
+        self.space.set_params(p, p.freeze); // FS1-hold blooms the reverb
     }
 
     /// Forward a looper transport event to the TIME engine (LOOPER mode).
@@ -40,9 +51,8 @@ impl DriftwoodEngine {
         }
         let g_in = 0.5 + 1.5 * p.input_gain(); // ~0.5..2.0 operating point
         let t = self.time.process(x * g_in);
-        // SPACE engine: pass-through until Phase 4.
-        let out = t * p.output_level();
-        soft_limit(out)
+        let s = self.space.process(t);
+        soft_limit(s * p.output_level())
     }
 }
 

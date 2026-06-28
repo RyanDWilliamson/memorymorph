@@ -36,8 +36,10 @@ const FS: f32 = 96_000.0;
 #[cfg(not(feature = "sampling_rate_96khz"))]
 const FS: f32 = 48_000.0;
 
-/// 1 s of mono audio memory in SDRAM (reserved for the TIME/SPACE engines).
-const DELAY_SAMPLES: usize = 96_000;
+/// TIME engine delay/loop memory in SDRAM (~1 s @ 96 kHz).
+const TIME_SAMPLES: usize = 96_000;
+/// Shimmer pitch-shifter window (SPACE engine).
+const SHIMMER_SAMPLES: usize = 2_048;
 
 static AUDIO_INTERFACE: Mutex<RefCell<Option<audio::Interface>>> = Mutex::new(RefCell::new(None));
 static ENGINE: Mutex<RefCell<Option<DriftwoodEngine>>> = Mutex::new(RefCell::new(None));
@@ -68,10 +70,18 @@ fn main() -> ! {
         &mut delay,
     );
 
+    // Partition the SDRAM into non-overlapping TIME / reverb / shimmer regions.
     let sdram = daisy::board_split_sdram!(cp, dp, ccdr, pins);
-    let audio_buf: &'static mut [f32] =
-        unsafe { core::slice::from_raw_parts_mut(sdram.base_address as *mut f32, DELAY_SAMPLES) };
-    let engine = DriftwoodEngine::new(FS, audio_buf);
+    let base = sdram.base_address as *mut f32;
+    let reverb_len = DriftwoodEngine::reverb_len(FS);
+    let (time_buf, reverb_buf, shimmer_buf) = unsafe {
+        (
+            core::slice::from_raw_parts_mut(base, TIME_SAMPLES),
+            core::slice::from_raw_parts_mut(base.add(TIME_SAMPLES), reverb_len),
+            core::slice::from_raw_parts_mut(base.add(TIME_SAMPLES + reverb_len), SHIMMER_SAMPLES),
+        )
+    };
+    let engine = DriftwoodEngine::new(FS, time_buf, reverb_buf, shimmer_buf);
     cortex_m::interrupt::free(|cs| {
         ENGINE.borrow(cs).replace(Some(engine));
     });

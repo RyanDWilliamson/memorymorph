@@ -127,6 +127,32 @@ impl Params {
         self.knobs[Page::Time.index()][5]
     }
 
+    // ── SPACE page ──────────────────────────────────────────────────────────
+    #[inline]
+    pub fn space_decay(&self) -> f32 {
+        self.knobs[Page::Space.index()][0]
+    }
+    #[inline]
+    pub fn space_regen(&self) -> f32 {
+        self.knobs[Page::Space.index()][1]
+    }
+    #[inline]
+    pub fn space_mod(&self) -> f32 {
+        self.knobs[Page::Space.index()][2]
+    }
+    #[inline]
+    pub fn space_age(&self) -> f32 {
+        self.knobs[Page::Space.index()][3]
+    }
+    #[inline]
+    pub fn space_mix(&self) -> f32 {
+        self.knobs[Page::Space.index()][4]
+    }
+    #[inline]
+    pub fn space_tone(&self) -> f32 {
+        self.knobs[Page::Space.index()][5]
+    }
+
     // ── MASTER page (global) ────────────────────────────────────────────────
     #[inline]
     pub fn input_gain(&self) -> f32 {

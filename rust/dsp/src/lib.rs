@@ -13,6 +13,7 @@ pub mod bbd;
 pub mod lofi;
 pub mod looper;
 pub mod movement;
+pub mod pitch;
 pub mod pt2399_reverb;
 pub mod saturation;
 pub mod takeover;
