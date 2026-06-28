@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), no_std)]
 
 mod onepole;
+pub mod bbd;
 pub mod lofi;
 pub mod saturation;
 pub mod takeover;
