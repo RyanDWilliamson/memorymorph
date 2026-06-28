@@ -1,10 +1,22 @@
-# Cassette LoFi Junky (Rust)
+# HotHouse Rust firmware
 
-A from-scratch **Rust** firmware for the Hothouse (Daisy Seed / STM32H750),
-living alongside the C++ firmwares in `../src` which stay as bench references.
-Built on the [`daisy`](https://crates.io/crates/daisy) BSP (no DaisySP — DSP is
-hand-ported). Mono, 96 kHz. See `../AGENTS.md` for hardware context and
-`/home/rdw/.claude/plans/based-off-of-what-validated-seahorse.md` for the full plan.
+From-scratch **Rust** firmware for the Hothouse (Daisy Seed / STM32H750), living
+alongside the C++ firmwares in `../src` which stay as bench references. Built on
+the [`daisy`](https://crates.io/crates/daisy) BSP (no DaisySP — DSP is
+hand-ported). Mono, 96 kHz. See `../AGENTS.md` for hardware context.
+
+This workspace now hosts **two pedals** sharing a platform library (`[lib]
+name = "hothouse"`): the control-surface HAL (`board`), the `delay` line, and
+each pedal's engine. Pure, host-testable DSP lives in the `dsp/` crate
+(`cargo test -p dsp` — 39 tests).
+
+- **Cassette LoFi Junky** — `--bin cassette-lofi-junky` — Gen-Loss-style tape
+  degradation.
+- **Driftwood** — `--bin driftwood` — dual-engine (TIME + SPACE + MOVEMENT)
+  Mood-style ambient machine; design in
+  [`docs/driftwood-plan.md`](docs/driftwood-plan.md), glossary in
+  [`src/driftwood/CONTEXT.md`](src/driftwood/CONTEXT.md), decisions in
+  [`docs/adr/`](docs/adr/).
 
 ## ⚠️ Confirm your Daisy Seed revision first
 
@@ -24,8 +36,31 @@ to change (`make build BOARD=seed`).
 ```sh
 make build                 # compile (seed_1_1 + 96 kHz)
 make build BOARD=seed      # compile for the original Seed
-make flash-dfu             # objcopy + dfu-util  (put Seed in DFU first)
+make flash-dfu             # flash Cassette LoFi Junky (Seed in DFU first)
+make flash-driftwood       # flash Driftwood
 ```
+
+### Driftwood control map
+
+Both engines run in series (`IN → TIME → SPACE → OUT`); the six knobs are paged
+by TOGGLE_1 with soft-takeover.
+
+| | TIME page | MASTER page | SPACE page |
+|---|---|---|---|
+| K1 | delay time | move rate | reverb decay |
+| K2 | repeats | move depth | regen |
+| K3 | warble | move shape | reverb mod |
+| K4 | drive | **input gain** | age/grit |
+| K5 | delay mix | move target | reverb mix |
+| K6 | time level | output level | reverb tone |
+
+- **TOGGLE_2** TIME mode: Looper / Delay / Tape-slip · **TOGGLE_3** SPACE
+  character: Dark / Modulated / Shimmer.
+- **FOOTSWITCH_1** is mode-dependent: in delay modes short = tap*, hold =
+  freeze/havoc; in Looper short = record→play→overdub, hold = stop/clear.
+- **FOOTSWITCH_2** = bypass (trails). DFU = both held + KNOB_5 dry, ~1.5 s.
+
+\* tap tempo + tap-sync and on-bench voicing are the remaining Phase-6 items.
 
 **Entering DFU without opening the pedal** (mandatory firmware gesture,
 bench-verified 2026-06-27): hold **both footswitches** with the **wet/dry
