@@ -55,6 +55,15 @@ static AUDIO_INTERFACE: Mutex<RefCell<Option<audio::Interface>>> = Mutex::new(Re
 static ENGINE: Mutex<RefCell<Option<DriftwoodEngine>>> = Mutex::new(RefCell::new(None));
 static PARAMS: Mutex<Cell<Params>> = Mutex::new(Cell::new(Params::DEFAULT));
 
+// The SPACE reverb network + shimmer are small and latency-critical, so they
+// live in fast internal RAM (not SDRAM): random access to SDRAM cache-misses and
+// stalls the audio ISR, which was overrunning the 96 kHz block and freezing the
+// firmware when the reverb was engaged. `REVERB_CAP` must be >= the reverb's
+// required length at FS (see the boot-time assert).
+const REVERB_CAP: usize = 14_336;
+static mut REVERB_MEM: [f32; REVERB_CAP] = [0.0; REVERB_CAP];
+static mut SHIMMER_MEM: [f32; SHIMMER_SAMPLES] = [0.0; SHIMMER_SAMPLES];
+
 #[entry]
 fn main() -> ! {
     let mut cp = cortex_m::Peripherals::take().unwrap();
@@ -80,17 +89,17 @@ fn main() -> ! {
         &mut delay,
     );
 
-    // Partition the SDRAM into non-overlapping TIME / reverb / shimmer regions.
+    // TIME delay/loop memory (large) lives in SDRAM; the reverb + shimmer buffers
+    // live in fast internal RAM (see REVERB_MEM / SHIMMER_MEM above).
+    assert!(
+        REVERB_CAP >= DriftwoodEngine::reverb_len(FS),
+        "REVERB_CAP too small for reverb at this sample rate"
+    );
     let sdram = daisy::board_split_sdram!(cp, dp, ccdr, pins);
-    let base = sdram.base_address as *mut f32;
-    let reverb_len = DriftwoodEngine::reverb_len(FS);
-    let (time_buf, reverb_buf, shimmer_buf) = unsafe {
-        (
-            core::slice::from_raw_parts_mut(base, TIME_SAMPLES),
-            core::slice::from_raw_parts_mut(base.add(TIME_SAMPLES), reverb_len),
-            core::slice::from_raw_parts_mut(base.add(TIME_SAMPLES + reverb_len), SHIMMER_SAMPLES),
-        )
-    };
+    let time_buf: &'static mut [f32] =
+        unsafe { core::slice::from_raw_parts_mut(sdram.base_address as *mut f32, TIME_SAMPLES) };
+    let reverb_buf: &'static mut [f32] = unsafe { &mut *core::ptr::addr_of_mut!(REVERB_MEM) };
+    let shimmer_buf: &'static mut [f32] = unsafe { &mut *core::ptr::addr_of_mut!(SHIMMER_MEM) };
     let engine = DriftwoodEngine::new(FS, time_buf, reverb_buf, shimmer_buf);
     cortex_m::interrupt::free(|cs| {
         ENGINE.borrow(cs).replace(Some(engine));

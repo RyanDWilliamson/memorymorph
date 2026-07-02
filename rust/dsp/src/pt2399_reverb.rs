@@ -32,6 +32,10 @@ const REF_FS: f32 = 44_100.0;
 const ALLPASS_FB: f32 = 0.5;
 /// Max modulation depth in samples (applied to comb read positions).
 const MOD_DEPTH_MAX: f32 = 28.0;
+/// Refresh the (expensive) comb-modulation sine only every N samples. The LFO is
+/// slow (< a few Hz), so block-rate refresh is inaudible but saves 3 of every 4
+/// `sinf` calls per comb — real CPU headroom in the 96 kHz audio ISR.
+const MOD_UPDATE: u32 = 16;
 
 struct Comb {
     offset: usize,
@@ -39,6 +43,7 @@ struct Comb {
     idx: usize,
     filt: f32, // damping low-pass state
     phase: f32,
+    mod_cached: f32, // modulation offset (samples), refreshed every MOD_UPDATE
 }
 
 struct Allpass {
@@ -59,6 +64,7 @@ pub struct Pt2399Reverb {
     drive: f32,     // feedback soft-clip drive
     lfo_inc: f32,
     mod_depth: f32, // samples
+    mod_tick: u32,  // counts samples; sinf refreshed when it wraps
 }
 
 impl Pt2399Reverb {
@@ -106,6 +112,7 @@ impl Pt2399Reverb {
             drive: 0.0,
             lfo_inc: 0.0,
             mod_depth: 0.0,
+            mod_tick: 0,
         };
         r.set_rate(0.6);
         r
@@ -147,9 +154,15 @@ impl Pt2399Reverb {
     pub fn process(&mut self, x: f32, feedback_inject: f32) -> f32 {
         let input = self.band.process(x) + feedback_inject;
 
+        let refresh_mod = self.mod_tick == 0;
+        self.mod_tick += 1;
+        if self.mod_tick >= MOD_UPDATE {
+            self.mod_tick = 0;
+        }
+
         let mut acc = 0.0f32;
         for c in 0..self.combs.len() {
-            acc += self.comb_tick(c, input);
+            acc += self.comb_tick(c, input, refresh_mod);
         }
         let mut y = acc * 0.25;
 
@@ -160,12 +173,17 @@ impl Pt2399Reverb {
     }
 
     #[inline]
-    fn comb_tick(&mut self, c: usize, input: f32) -> f32 {
+    fn comb_tick(&mut self, c: usize, input: f32, refresh_mod: bool) -> f32 {
         let (offset, len) = (self.combs[c].offset, self.combs[c].len);
 
-        // Modulated fractional read position, just behind the write index.
-        let phase = self.combs[c].phase;
-        let mod_samp = self.mod_depth * 0.5 * (1.0 + sinf(core::f32::consts::TAU * phase));
+        // Modulated fractional read position, just behind the write index. The
+        // sine is only recomputed every MOD_UPDATE samples (see process()).
+        if refresh_mod {
+            let phase = self.combs[c].phase;
+            self.combs[c].mod_cached =
+                self.mod_depth * 0.5 * (1.0 + sinf(core::f32::consts::TAU * phase));
+        }
+        let mod_samp = self.combs[c].mod_cached;
         let read = self.combs[c].idx as f32 - mod_samp;
         let out = self.read_frac(offset, len, read);
 
@@ -178,7 +196,9 @@ impl Pt2399Reverb {
         self.mem[offset + idx] = input + fed * self.feedback;
         self.combs[c].idx = (idx + 1) % len;
 
-        let mut phase = phase + self.lfo_inc;
+        // Advance the LFO phase every sample (cheap); the sine itself is only
+        // evaluated on refresh ticks.
+        let mut phase = self.combs[c].phase + self.lfo_inc;
         if phase >= 1.0 {
             phase -= 1.0;
         }
@@ -234,6 +254,7 @@ fn mk_comb((offset, len): (usize, usize), phase: f32) -> Comb {
         idx: 0,
         filt: 0.0,
         phase,
+        mod_cached: 0.0,
     }
 }
 
