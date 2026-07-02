@@ -1,11 +1,12 @@
 # Cassette LoFi Junky — build / flash helpers.
 #
-# BOARD selects the Daisy Seed revision (codec). CONFIRM YOUR REV before flashing:
+# BOARD selects the Daisy Seed revision (codec). The bench Seed is a 1.2 (PCM3060),
+# confirmed 2026-07-02 — that's the default. Override for another board:
 #   seed      = original Seed  (AK4556)
-#   seed_1_1  = Seed 1.1       (WM8731)   <- default
-#   seed_1_2  = Seed 1.2       (PCM3060)
+#   seed_1_1  = Seed 1.1       (WM8731)
+#   seed_1_2  = Seed 1.2       (PCM3060)  <- default (bench board)
 #
-#   make build                 # compile (default features: seed_1_1 + 96 kHz)
+#   make build                 # compile (default features: seed_1_2 + 96 kHz)
 #   make flash-dfu             # flash the full cassette firmware (Seed in DFU first)
 #   make flash-driftwood       # flash the Driftwood firmware
 #   make flash-bringup         # codec-independent board test (older, hidden LED)
@@ -14,7 +15,7 @@
 #   make flash                 # probe-rs (requires a debug probe)
 
 CARGO := cargo
-BOARD ?= seed_1_1
+BOARD ?= seed_1_2
 FEATURES := $(BOARD),sampling_rate_96khz
 # The package ships several binaries (cassette + driftwood firmware, plus the
 # bring-up/validate tests), so objcopy must be told which one to convert.

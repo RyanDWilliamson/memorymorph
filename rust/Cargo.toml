@@ -28,10 +28,11 @@ dsp = { path = "dsp" }
 
 [features]
 # Board revision is mandatory and mutually exclusive — daisy emits a compile_error
-# if none is selected. DEFAULT IS seed_1_1 (WM8731 codec); CONFIRM YOUR SEED REV on
-# the bench before trusting audio. Override with e.g.
+# if none is selected. DEFAULT IS seed_1_2 (PCM3060 codec): the bench Daisy Seed
+# was confirmed to be a 1.2 on 2026-07-02 (seed_1_1 = silence, seed = motorboating,
+# seed_1_2 = clean). Override for a different board with e.g.
 #   cargo build --release --no-default-features --features seed,sampling_rate_96khz
-default = ["seed_1_1", "sampling_rate_96khz"]
+default = ["seed_1_2", "sampling_rate_96khz"]
 
 seed = ["daisy/seed"]               # original Daisy Seed, AK4556 codec
 seed_1_1 = ["daisy/seed_1_1"]       # Daisy Seed 1.1, WM8731 codec
