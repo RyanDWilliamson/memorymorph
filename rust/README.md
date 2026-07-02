@@ -20,22 +20,24 @@ each pedal's engine. Pure, host-testable DSP lives in the `dsp/` crate
 
 ## ⚠️ Confirm your Daisy Seed revision first
 
-The codec differs by board rev and the wrong feature = silence:
+The codec differs by board rev and the wrong feature = silence (or motorboating):
 
 | Feature | Board | Codec |
 |---|---|---|
 | `seed` | original Daisy Seed | AK4556 |
-| `seed_1_1` *(default)* | Daisy Seed 1.1 | WM8731 |
-| `seed_1_2` | Daisy Seed 1.2 | PCM3060 |
+| `seed_1_1` | Daisy Seed 1.1 | WM8731 |
+| `seed_1_2` *(default)* | Daisy Seed 1.2 | PCM3060 |
 
-Default is `seed_1_1`. If audio is silent on the bench, that's the first thing
-to change (`make build BOARD=seed`).
+Default is `seed_1_2` — the **bench Daisy Seed is a rev 1.2** (confirmed
+2026-07-02: `seed_1_1` = silence, `seed` = motorboating, `seed_1_2` = clean). For
+a different board, override with `make ... BOARD=seed` etc. If audio is ever
+silent on a fresh board, the codec feature is the first thing to check.
 
 ## Build & flash
 
 ```sh
-make build                 # compile (seed_1_1 + 96 kHz)
-make build BOARD=seed      # compile for the original Seed
+make build                 # compile (seed_1_2 + 96 kHz)
+make build BOARD=seed_1_1  # compile for a Seed 1.1 board
 make flash-dfu             # flash Cassette LoFi Junky (Seed in DFU first)
 make flash-driftwood       # flash Driftwood
 ```
