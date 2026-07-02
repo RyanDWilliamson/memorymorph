@@ -61,7 +61,11 @@ impl DriftwoodEngine {
         self.movement.tick();
         let g_in = 0.5 + 1.5 * p.input_gain(); // ~0.5..2.0 operating point
         let t = self.time.process(x * g_in, self.movement.vib());
-        let s = self.space.process(t, self.movement.send_gain());
+        // DIAGNOSTIC (freeze hunt): SPACE bypassed to test whether the reverb is
+        // the cause. If the pedal engages cleanly with this, the freeze is in the
+        // reverb; if it still freezes, the cause is MOVEMENT/wiring, not SPACE.
+        let _ = self.movement.send_gain();
+        let s = t; // self.space.process(t, self.movement.send_gain());
         let out = self.movement.apply_amp(s);
         soft_limit(out * p.output_level())
     }
