@@ -324,6 +324,24 @@ impl BootloaderGesture {
 // teardown, no pre_init trampoline. Every previous "jump to 0x1FF09800"
 // variant was solving the wrong problem; this is what libDaisy actually does.
 
+/// Enable the FPU's **flush-to-zero** mode (FPSCR.FZ) and default-NaN.
+///
+/// Denormal floats — which a decaying delay or reverb tail produces once the
+/// signal collapses toward zero — take a large cycle penalty on the Cortex-M7
+/// FPU. In a per-sample feedback loop that penalty blows the 96 kHz audio-ISR
+/// budget and locks the firmware. Flush-to-zero treats denormals as 0.0
+/// (inaudible), keeping every op single-cycle. Call once at startup; the FPU is
+/// already enabled by cortex-m-rt on this hardfloat target.
+pub fn enable_flush_to_zero() {
+    unsafe {
+        let mut fpscr: u32;
+        core::arch::asm!("vmrs {}, fpscr", out(reg) fpscr);
+        fpscr |= 1 << 24; // FZ  — flush denormals to zero
+        fpscr |= 1 << 25; // DN  — default NaN (a NaN can't linger in a feedback loop)
+        core::arch::asm!("vmsr fpscr, {}", in(reg) fpscr);
+    }
+}
+
 /// Request the STM32 system bootloader (USB DFU). Drives PG3 (= BOOT0) HIGH
 /// and triggers a chip reset — the hardware boot logic does the rest. No
 /// post-trigger LED diagnostic: the *accelerating* flash during the gesture

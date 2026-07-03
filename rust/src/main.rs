@@ -50,6 +50,7 @@ fn main() -> ! {
 
     cp.SCB.enable_icache();
     cp.SCB.enable_dcache(&mut cp.CPUID);
+    hothouse::board::enable_flush_to_zero(); // denormal tails must not stall the ISR
 
     let ccdr = daisy::board_freeze_clocks!(board, dp);
     let pins = daisy::board_split_gpios!(board, ccdr, dp);
