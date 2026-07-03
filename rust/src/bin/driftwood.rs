@@ -168,6 +168,14 @@ fn main() -> ! {
             FootswitchEvent::Released => fs1_held = false,
             _ => {}
         }
+        // The tracker suppresses the Released event after a LongPress (so a
+        // freeze-hold doesn't also register as a tap) — which left fs1_held
+        // latched true forever after any ≥2 s hold, i.e. a permanently frozen,
+        // self-oscillating delay ("sounds like a loop"). The raw switch state
+        // always clears the hold.
+        if !state.footswitches[0] {
+            fs1_held = false;
+        }
 
         // FOOTSWITCH_1 is mode-dependent (TOGGLE_2). In LOOPER it is the
         // transport (short = record→play→overdub, hold = stop/clear). In the
