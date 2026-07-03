@@ -18,13 +18,13 @@
 #![no_std]
 
 use core::cell::{Cell, RefCell};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use cortex_m::interrupt::Mutex;
-use cortex_m_rt::entry;
-use panic_halt as _;
+use cortex_m_rt::{entry, exception};
 
 use stm32h7xx_hal::delay::Delay;
-use stm32h7xx_hal::pac::interrupt;
+use stm32h7xx_hal::pac::{self, interrupt};
 
 use daisy::audio;
 use dsp::looper::LooperInput;
@@ -50,6 +50,16 @@ const TAP_MIN_MS: u32 = 100;
 const TAP_MAX_MS: u32 = 1_200;
 /// Knob movement (resolved TIME-time) beyond this releases tap-tempo override.
 const KNOB_MOVE_EPS: f32 = 0.01;
+
+// ── Lock-up diagnostics ─────────────────────────────────────────────────────
+// The pedal locks with digital artifacts when engaged; the LEDs report the
+// failure mode directly so we measure instead of guessing:
+//   LED1 sticks ON while engaged      → audio-ISR CPU overrun (block > budget)
+//   both LEDs strobe TOGETHER (~10Hz) → Rust panic
+//   LEDs strobe ALTERNATING  (~10Hz)  → HardFault (bus/memory fault)
+/// Cycle budget for one 48-sample block: 48/96kHz = 500 µs @ 480 MHz.
+const BLOCK_BUDGET_CYCLES: u32 = 240_000;
+static ISR_OVERRUN: AtomicBool = AtomicBool::new(false);
 
 static AUDIO_INTERFACE: Mutex<RefCell<Option<audio::Interface>>> = Mutex::new(RefCell::new(None));
 static ENGINE: Mutex<RefCell<Option<DriftwoodEngine>>> = Mutex::new(RefCell::new(None));
@@ -210,7 +220,8 @@ fn main() -> ! {
         };
         cortex_m::interrupt::free(|cs| PARAMS.borrow(cs).set(params));
 
-        controls.set_led(0, freeze); // LED1 = freeze held (tap pulse later)
+        // LED1 = freeze held, or sticky ISR-overrun report (diagnostics).
+        controls.set_led(0, freeze || ISR_OVERRUN.load(Ordering::Relaxed));
         controls.set_led(1, !bypass); // LED2 = effect active
 
         if clock.elapsed_ms(heartbeat) >= 500 {
@@ -221,8 +232,11 @@ fn main() -> ! {
 }
 
 /// Audio block ready: run the Driftwood chain, mono in → both out.
+/// Instrumented: measures the block's cycle cost against `BLOCK_BUDGET_CYCLES`
+/// and reports overrun on LED1 (raw GPIO — works even if the main loop starves).
 #[interrupt]
 fn DMA1_STR1() {
+    let t0 = cortex_m::peripheral::DWT::cycle_count();
     cortex_m::interrupt::free(|cs| {
         if let Some(audio_interface) = AUDIO_INTERFACE.borrow(cs).borrow_mut().as_mut() {
             let params = PARAMS.borrow(cs).get();
@@ -240,4 +254,49 @@ fn DMA1_STR1() {
             }
         }
     });
+    let dt = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0);
+    if dt > BLOCK_BUDGET_CYCLES {
+        ISR_OVERRUN.store(true, Ordering::Relaxed);
+        // LED1 = PA5, set directly so the report survives a starved main loop.
+        unsafe { (*pac::GPIOA::PTR).bsrr.write(|w| w.bs5().set_bit()) };
+    }
+}
+
+// ── Failure-mode reporters (see the diagnostics comment near the top) ────────
+
+/// Drive LED1 (PA5) / LED2 (PA4) from a context where the HAL is unavailable.
+unsafe fn raw_leds(led1: bool, led2: bool) {
+    let gpioa = &*pac::GPIOA::PTR;
+    gpioa.bsrr.write(|w| {
+        let w = if led1 { w.bs5().set_bit() } else { w.br5().set_bit() };
+        if led2 {
+            w.bs4().set_bit()
+        } else {
+            w.br4().set_bit()
+        }
+    });
+}
+
+/// Rust panic → both LEDs strobe together (~10 Hz).
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    cortex_m::interrupt::disable();
+    loop {
+        unsafe { raw_leds(true, true) };
+        cortex_m::asm::delay(24_000_000); // ~50 ms @ 480 MHz
+        unsafe { raw_leds(false, false) };
+        cortex_m::asm::delay(24_000_000);
+    }
+}
+
+/// HardFault (bus/memory fault) → LEDs strobe alternating (~10 Hz).
+#[exception]
+unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
+    cortex_m::interrupt::disable();
+    loop {
+        raw_leds(true, false);
+        cortex_m::asm::delay(24_000_000);
+        raw_leds(false, true);
+        cortex_m::asm::delay(24_000_000);
+    }
 }

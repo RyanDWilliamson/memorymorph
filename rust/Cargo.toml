@@ -44,6 +44,11 @@ codegen-units = 1
 debug = true            # symbols don't cost FLASH; helpful for probe-rs
 lto = true
 opt-level = "s"         # FLASH is only 128K — optimise for size
+
+# The DSP hot path runs per-sample at 96 kHz — optimise it for speed, not size.
+# (Only the dsp crate; the firmware glue stays at "s" to protect FLASH.)
+[profile.release.package.dsp]
+opt-level = 3
 overflow-checks = false
 
 [profile.dev]
