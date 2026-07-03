@@ -27,7 +27,7 @@ use stm32h7xx_hal::delay::Delay;
 use stm32h7xx_hal::pac::{self, interrupt};
 
 use daisy::audio;
-use dsp::looper::LooperInput;
+use dsp::looper::{LooperInput, LooperState};
 use hothouse::board::{self, BootloaderGesture, Clock, Controls, FootswitchEvent, FootswitchTracker};
 use hothouse::driftwood::{DriftwoodEngine, Page, PagedKnobs, Params, SpaceMode, TimeMode};
 
@@ -238,8 +238,28 @@ fn main() -> ! {
         };
         cortex_m::interrupt::free(|cs| PARAMS.borrow(cs).set(params));
 
-        // LED1 is owned by the ISR overrun meter while we chase the lock-up
-        // (normally: freeze / tap indicator — restore once the lock is fixed).
+        // LED1 = state indicator (the ISR overrun meter overrides it while an
+        // overrun is recent). Decode:
+        //   delay modes: solid = FREEZE is active (if this is on and you are
+        //                not holding FS1, the switch reads stuck-pressed)
+        //   looper:      solid = recording/overdubbing · blink = loop playing
+        let lstate = cortex_m::interrupt::free(|cs| {
+            ENGINE
+                .borrow(cs)
+                .borrow_mut()
+                .as_mut()
+                .map(|e| e.looper_state())
+        });
+        let led1 = if let TimeMode::Looper = time_mode {
+            match lstate {
+                Some(LooperState::Recording) | Some(LooperState::Overdubbing) => true,
+                Some(LooperState::Playing) => (clock.elapsed_ms(heartbeat) / 250).is_multiple_of(2),
+                _ => false,
+            }
+        } else {
+            freeze
+        };
+        controls.set_led(0, led1);
         controls.set_led(1, !bypass); // LED2 = effect active
 
         if clock.elapsed_ms(heartbeat) >= 500 {
@@ -273,19 +293,21 @@ fn DMA1_STR1() {
         }
     });
     let dt = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0);
-    // Live overrun meter on LED1 (PA5), ISR-owned so it works even when the
-    // main loop is starved: solid = sustained overrun, blink = one-off hiccup.
+    // Live overrun meter on LED1 (PA5): forces LED1 on while an overrun is
+    // recent (survives a starved main loop) and releases it back to the main
+    // loop's freeze/looper indication otherwise (writes only on the 1→0 edge).
+    let prev = OVERRUN_HOLD.load(Ordering::Relaxed);
     let hold = if dt > BLOCK_BUDGET_CYCLES {
         OVERRUN_HOLD_BLOCKS
     } else {
-        OVERRUN_HOLD.load(Ordering::Relaxed).saturating_sub(1)
+        prev.saturating_sub(1)
     };
     OVERRUN_HOLD.store(hold, Ordering::Relaxed);
     unsafe {
         let gpioa = &*pac::GPIOA::PTR;
         if hold > 0 {
             gpioa.bsrr.write(|w| w.bs5().set_bit());
-        } else {
+        } else if prev > 0 {
             gpioa.bsrr.write(|w| w.br5().set_bit());
         }
     }

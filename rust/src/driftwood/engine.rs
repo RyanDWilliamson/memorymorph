@@ -48,6 +48,11 @@ impl DriftwoodEngine {
         self.time.looper_transport(input);
     }
 
+    /// Current looper transport state (for LED feedback).
+    pub fn looper_state(&self) -> dsp::looper::LooperState {
+        self.time.looper_state()
+    }
+
     /// Re-align the MOVEMENT LFO to a tap (tap-sync).
     pub fn tap_sync(&mut self) {
         self.movement.reset();

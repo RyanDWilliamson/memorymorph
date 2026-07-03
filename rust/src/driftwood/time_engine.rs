@@ -117,6 +117,11 @@ impl TimeEngine {
             .set_time(self.cur_delay / self.fs, self.fb_target.min(1.0));
     }
 
+    /// Current looper transport state (for LED feedback).
+    pub fn looper_state(&self) -> dsp::looper::LooperState {
+        self.looper.state()
+    }
+
     /// Apply a looper transport event (called from the control loop, under a
     /// critical section). Only meaningful in [`TimeMode::Looper`].
     pub fn looper_transport(&mut self, input: LooperInput) {
