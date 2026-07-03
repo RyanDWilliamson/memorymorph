@@ -66,10 +66,14 @@ impl SpaceEngine {
             .set_mod((p.space_mod() * mod_scale).clamp(0.0, 1.0));
         self.reverb.set_rate(0.3 + p.space_mod() * 0.8);
 
+        // Audit: the outer regen loop multiplies with the reverb's internal
+        // comb feedback; near decay resonance the product exceeds unity and the
+        // reverb self-sustains at moderate knob settings. Bound the outer loop
+        // decay-aware — less outer regen headroom as the internal tail grows.
         let regen = if bloom {
             BLOOM_REGEN
         } else {
-            0.8 * p.space_regen()
+            0.5 * p.space_regen() * (1.0 - 0.6 * p.space_decay())
         };
         self.regen = regen.clamp(0.0, BLOOM_REGEN);
         self.shimmer_amt = if shimmer_on {

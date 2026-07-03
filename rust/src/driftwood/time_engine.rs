@@ -172,7 +172,10 @@ impl TimeEngine {
             (self.feedback, x)
         };
         let drive_gain = 1.0 + 3.0 * self.drive;
-        let write_in = self.bbd.pre(input * drive_gain + wet * fb);
+        // Recirculate in the compressed domain (read_raw, exactly as stored):
+        // expanding + re-compressing the loop gives the compander a non-zero
+        // fixed point — repeats that never decay (bench "eternal loop" bug).
+        let write_in = self.bbd.pre_mix(input * drive_gain, read_raw * fb);
         self.delay.write(write_in);
 
         (x * (1.0 - self.mix) + wet * self.mix) * self.level

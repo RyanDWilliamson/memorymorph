@@ -103,9 +103,23 @@ impl Bbd {
     /// Input stage: 2:1 compress → charge-transfer soft clip → anti-alias LPF.
     #[inline]
     pub fn pre(&mut self, x: f32) -> f32 {
+        self.pre_mix(x, 0.0)
+    }
+
+    /// Input stage with recirculation. The dry input is compressed, but the
+    /// feedback re-enters in the **compressed domain** (`read·fb`, exactly as
+    /// stored). It must NOT be expanded and re-compressed around the loop: an
+    /// ideal 2:1 compander inside a feedback loop has a stable non-zero fixed
+    /// point (A* = fb²·REF) — repeats that never decay, converging to a
+    /// self-sustaining platform. Compressed-domain feedback makes the loop
+    /// linear in `fb` (true exponential decay) while still passing the
+    /// charge-transfer clip and anti-alias filter every pass, so per-pass
+    /// darkening and the freeze/havoc clip-limit are preserved.
+    #[inline]
+    pub fn pre_mix(&mut self, x: f32, feedback_compressed: f32) -> f32 {
         self.comp_env += self.env_coeff * (abs(x) - self.comp_env);
         let gain = fastmath::sqrt(REF / (self.comp_env + ENV_EPS)).clamp(0.5, 6.0);
-        let compressed = soft_clip(x * gain);
+        let compressed = soft_clip(x * gain + feedback_compressed);
         self.pre_lp.process(compressed)
     }
 
@@ -210,6 +224,42 @@ mod tests {
         assert!(
             (0.5..2.0).contains(&ratio),
             "companding should roughly preserve level, ratio={ratio}"
+        );
+    }
+
+    #[test]
+    fn feedback_loop_repeats_decay_to_silence() {
+        // Regression for the "eternal loop" bench bug: expanding + re-
+        // compressing the recirculation gives the compander a stable non-zero
+        // fixed point (A* = fb²·REF) — repeats sustain forever. With
+        // compressed-domain feedback (pre_mix) the loop must decay. Simulates
+        // the TimeEngine wiring with a 10 ms loop at fb = 0.9.
+        let mut b = Bbd::new(FS);
+        b.set_noise(0.0); // isolate the loop math from the hiss floor
+        b.set_time(0.01, 0.9);
+        let n = 960;
+        let mut delay = vec![0.0f32; n];
+        let mut w = 0usize;
+        let fb = 0.9f32;
+        let mut late_peak = 0.0f32;
+        for i in 0..(FS as usize * 4) {
+            // 50 ms input burst, then silence.
+            let x = if i < 4800 {
+                0.5 * libm::sinf(core::f32::consts::TAU * 220.0 * i as f32 / FS)
+            } else {
+                0.0
+            };
+            let read = delay[w];
+            let wet = b.post(read);
+            delay[w] = b.pre_mix(x, read * fb);
+            w = (w + 1) % n;
+            if i > FS as usize * 3 {
+                late_peak = late_peak.max(wet.abs());
+            }
+        }
+        assert!(
+            late_peak < 1.0e-3,
+            "repeats must decay to silence, late peak {late_peak}"
         );
     }
 
