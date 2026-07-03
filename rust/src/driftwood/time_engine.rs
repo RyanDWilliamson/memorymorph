@@ -13,10 +13,11 @@
 //! [`looper_transport`]: TimeEngine::looper_transport
 
 use dsp::bbd::Bbd;
+use dsp::fastmath;
 use dsp::looper::{Looper, LooperAction, LooperInput};
 use dsp::warble::Warble;
 use dsp::one_pole_coeff;
-use libm::{powf, sinf};
+use libm::powf;
 
 use super::params::{Params, TimeMode};
 use crate::delay::DelayLine;
@@ -29,7 +30,6 @@ const HAVOC_FB: f32 = 1.015;
 const SLIP_DRIFT_HZ: f32 = 0.13;
 /// Overdub layer decay, so stacked passes don't build up without bound.
 const OVERDUB_DECAY: f32 = 0.96;
-const TAU: f32 = core::f32::consts::TAU;
 
 pub struct TimeEngine {
     fs: f32,
@@ -154,7 +154,7 @@ impl TimeEngine {
             if self.slip_phase >= 1.0 {
                 self.slip_phase -= 1.0;
             }
-            mod_frac += 0.03 * sinf(TAU * self.slip_phase); // slow wander
+            mod_frac += 0.03 * fastmath::sin_01(self.slip_phase); // slow wander
         }
 
         let read_samples = self.cur_delay * (1.0 + mod_frac);

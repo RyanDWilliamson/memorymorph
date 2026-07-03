@@ -20,8 +20,7 @@
 //!
 //! Pure `libm` math; host-tested under `cargo test`.
 
-use libm::{floorf, sinf};
-
+use crate::fastmath;
 use crate::onepole::OnePole;
 
 /// Comb delay tunings (samples @ 44.1 kHz, Freeverb-derived); scaled to `fs`.
@@ -181,7 +180,7 @@ impl Pt2399Reverb {
         if refresh_mod {
             let phase = self.combs[c].phase;
             self.combs[c].mod_cached =
-                self.mod_depth * 0.5 * (1.0 + sinf(core::f32::consts::TAU * phase));
+                self.mod_depth * 0.5 * (1.0 + fastmath::sin_01(phase));
         }
         let mod_samp = self.combs[c].mod_cached;
         let read = self.combs[c].idx as f32 - mod_samp;
@@ -233,7 +232,8 @@ impl Pt2399Reverb {
         while p >= lenf {
             p -= lenf;
         }
-        let i0 = floorf(p) as usize;
+        // p ∈ [0, len) after the wraps above, so integer truncation == floor.
+        let i0 = p as usize;
         let frac = p - i0 as f32;
         let i1 = if i0 + 1 >= len { 0 } else { i0 + 1 };
         let a = self.mem[offset + i0];
@@ -269,7 +269,7 @@ fn mk_allpass((offset, len): (usize, usize)) -> Allpass {
 /// Coarse amplitude quantisation (PT2399 converter grain).
 #[inline]
 fn quantize(x: f32, levels: f32) -> f32 {
-    floorf(x * levels + 0.5) / levels
+    fastmath::round(x * levels) / levels
 }
 
 /// Waveform-preserving soft clip for the dirty feedback path.

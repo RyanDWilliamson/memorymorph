@@ -18,7 +18,7 @@
 #![no_std]
 
 use core::cell::{Cell, RefCell};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use cortex_m::interrupt::Mutex;
 use cortex_m_rt::{entry, exception};
@@ -54,12 +54,22 @@ const KNOB_MOVE_EPS: f32 = 0.01;
 // ── Lock-up diagnostics ─────────────────────────────────────────────────────
 // The pedal locks with digital artifacts when engaged; the LEDs report the
 // failure mode directly so we measure instead of guessing:
-//   LED1 sticks ON while engaged      → audio-ISR CPU overrun (block > budget)
+//   LED1 ON (live, ISR-owned)         → audio-ISR CPU overrun within the last
+//                                       second; SOLID while locked = sustained
 //   both LEDs strobe TOGETHER (~10Hz) → Rust panic
 //   LEDs strobe ALTERNATING  (~10Hz)  → HardFault (bus/memory fault)
-/// Cycle budget for one 48-sample block: 48/96kHz = 500 µs @ 480 MHz.
-const BLOCK_BUDGET_CYCLES: u32 = 240_000;
-static ISR_OVERRUN: AtomicBool = AtomicBool::new(false);
+//
+// Cycle budget per DMA block: at 480 MHz / 96 kHz each sample is 5 000 cycles;
+// the BSP's block length is `daisy::audio::BLOCK_LENGTH` (feature-dependent).
+#[cfg(feature = "sampling_rate_96khz")]
+const CYCLES_PER_SAMPLE: u32 = 5_000;
+#[cfg(not(feature = "sampling_rate_96khz"))]
+const CYCLES_PER_SAMPLE: u32 = 10_000;
+const BLOCK_BUDGET_CYCLES: u32 = CYCLES_PER_SAMPLE * daisy::audio::BLOCK_LENGTH as u32;
+/// Blocks to hold the overrun LED after the last overrun (~1 s), so single
+/// hiccups read as a blink and a sustained overrun reads as solid.
+const OVERRUN_HOLD_BLOCKS: u32 = 96_000 / daisy::audio::BLOCK_LENGTH as u32;
+static OVERRUN_HOLD: AtomicU32 = AtomicU32::new(0);
 
 static AUDIO_INTERFACE: Mutex<RefCell<Option<audio::Interface>>> = Mutex::new(RefCell::new(None));
 static ENGINE: Mutex<RefCell<Option<DriftwoodEngine>>> = Mutex::new(RefCell::new(None));
@@ -220,8 +230,8 @@ fn main() -> ! {
         };
         cortex_m::interrupt::free(|cs| PARAMS.borrow(cs).set(params));
 
-        // LED1 = freeze held, or sticky ISR-overrun report (diagnostics).
-        controls.set_led(0, freeze || ISR_OVERRUN.load(Ordering::Relaxed));
+        // LED1 is owned by the ISR overrun meter while we chase the lock-up
+        // (normally: freeze / tap indicator — restore once the lock is fixed).
         controls.set_led(1, !bypass); // LED2 = effect active
 
         if clock.elapsed_ms(heartbeat) >= 500 {
@@ -255,10 +265,21 @@ fn DMA1_STR1() {
         }
     });
     let dt = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0);
-    if dt > BLOCK_BUDGET_CYCLES {
-        ISR_OVERRUN.store(true, Ordering::Relaxed);
-        // LED1 = PA5, set directly so the report survives a starved main loop.
-        unsafe { (*pac::GPIOA::PTR).bsrr.write(|w| w.bs5().set_bit()) };
+    // Live overrun meter on LED1 (PA5), ISR-owned so it works even when the
+    // main loop is starved: solid = sustained overrun, blink = one-off hiccup.
+    let hold = if dt > BLOCK_BUDGET_CYCLES {
+        OVERRUN_HOLD_BLOCKS
+    } else {
+        OVERRUN_HOLD.load(Ordering::Relaxed).saturating_sub(1)
+    };
+    OVERRUN_HOLD.store(hold, Ordering::Relaxed);
+    unsafe {
+        let gpioa = &*pac::GPIOA::PTR;
+        if hold > 0 {
+            gpioa.bsrr.write(|w| w.bs5().set_bit());
+        } else {
+            gpioa.bsrr.write(|w| w.br5().set_bit());
+        }
     }
 }
 

@@ -16,8 +16,7 @@
 //!
 //! Pure `libm` math; host-tested under `cargo test`.
 
-use libm::sinf;
-
+use crate::fastmath;
 use crate::onepole::OnePole;
 
 /// Movement waveform. `Harmonic` selects the harmonic-tremolo voice (driven by a
@@ -93,7 +92,7 @@ impl Lfo {
     fn shape_value(&self, phase: f32) -> f32 {
         match self.shape {
             // Harmonic uses a sine carrier; the band-split lives in HarmonicTrem.
-            Shape::Sine | Shape::Harmonic => 0.5 + 0.5 * sinf(core::f32::consts::TAU * phase),
+            Shape::Sine | Shape::Harmonic => 0.5 + 0.5 * fastmath::sin_01(phase),
             Shape::Square => {
                 if phase < 0.5 {
                     1.0

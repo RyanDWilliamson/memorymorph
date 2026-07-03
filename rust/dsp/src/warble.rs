@@ -7,8 +7,7 @@
 //! that as `amount` rises for the "wild" end). This is the modulation *source*;
 //! the delay line itself lives in the firmware (SDRAM).
 
-use crate::TWO_PI;
-use libm::sinf;
+use crate::fastmath;
 
 pub struct Warble {
     wow_phase: f32,
@@ -45,8 +44,8 @@ impl Warble {
     /// the high end of the knob gets genuinely unstable.
     #[inline]
     pub fn process(&mut self) -> f32 {
-        let wow = sinf(self.wow_phase * TWO_PI);
-        let flutter = sinf(self.flutter_phase * TWO_PI);
+        let wow = fastmath::sin_01(self.wow_phase);
+        let flutter = fastmath::sin_01(self.flutter_phase);
 
         self.wow_phase += self.wow_inc;
         if self.wow_phase >= 1.0 {

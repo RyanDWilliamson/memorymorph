@@ -28,8 +28,7 @@
 //!
 //! Pure `libm` math; host-tested under `cargo test`.
 
-use libm::sqrtf;
-
+use crate::fastmath;
 use crate::onepole::OnePole;
 
 /// Effective BBD stage count — sets how the clock (and therefore bandwidth)
@@ -105,7 +104,7 @@ impl Bbd {
     #[inline]
     pub fn pre(&mut self, x: f32) -> f32 {
         self.comp_env += self.env_coeff * (abs(x) - self.comp_env);
-        let gain = sqrtf(REF / (self.comp_env + ENV_EPS)).clamp(0.5, 6.0);
+        let gain = fastmath::sqrt(REF / (self.comp_env + ENV_EPS)).clamp(0.5, 6.0);
         let compressed = soft_clip(x * gain);
         self.pre_lp.process(compressed)
     }
@@ -116,7 +115,7 @@ impl Bbd {
         let filtered = self.post_lp.process(x);
         let noisy = filtered + self.white() * self.noise_amt;
         self.exp_env += self.env_coeff * (abs(noisy) - self.exp_env);
-        let gain = sqrtf((self.exp_env + ENV_EPS) / REF).clamp(0.1, 2.0);
+        let gain = fastmath::sqrt((self.exp_env + ENV_EPS) / REF).clamp(0.1, 2.0);
         noisy * gain
     }
 
