@@ -54,6 +54,12 @@ pub struct TimeEngine {
     level: f32,
 
     slip_phase: f32,
+    /// Precomputed `SLIP_DRIFT_HZ / fs` (hoists a per-sample divide).
+    slip_inc: f32,
+
+    // Block-rate memoization (skip libm powf/expf when inputs are stable).
+    last_time_in: (f32, f32), // (time knob, tap_delay_s) → target_delay
+    last_bbd_in: (f32, f32),  // (cur_delay, fb) the BBD bandwidth was set for
 
     // Looper.
     looper: Looper,
@@ -82,6 +88,9 @@ impl TimeEngine {
             mix: 0.4,
             level: 0.8,
             slip_phase: 0.0,
+            slip_inc: SLIP_DRIFT_HZ / fs,
+            last_time_in: (f32::NAN, f32::NAN), // force first computation
+            last_bbd_in: (f32::NAN, f32::NAN),
             looper: Looper::new(),
             loop_len: 0,
             loop_pos: 0,
@@ -91,16 +100,34 @@ impl TimeEngine {
 
     /// Map parameters once per audio block.
     pub fn set_params(&mut self, p: &Params) {
+        // The looper transport and the delay modes share one buffer: the delay
+        // write head streams over the loop region, so any captured loop is
+        // garbage after a visit to a delay mode. Invalidate the transport on
+        // every mode change that involves the looper (no buffer zeroing needed:
+        // Empty never plays, and recording overwrites before playback).
+        if p.time_mode != self.mode
+            && (p.time_mode == TimeMode::Looper || self.mode == TimeMode::Looper)
+        {
+            self.looper = Looper::new();
+            self.loop_len = 0;
+            self.loop_pos = 0;
+            self.rec_pos = 0;
+        }
         self.mode = p.time_mode;
         self.freeze = p.freeze;
 
-        // Tap tempo overrides the knob until the knob is next moved.
-        let ds = if p.tap_delay_s > 0.0 {
-            p.tap_delay_s.clamp(MIN_DELAY_S, MAX_DELAY_S)
-        } else {
-            MIN_DELAY_S * powf(MAX_DELAY_S / MIN_DELAY_S, p.time_time())
-        };
-        self.target_delay = (ds * self.fs).clamp(1.0, (self.delay.len() - 2) as f32);
+        // Tap tempo overrides the knob until the knob is next moved. The powf
+        // only runs when the pair of inputs actually changed.
+        let time_in = (p.time_time(), p.tap_delay_s);
+        if time_in != self.last_time_in {
+            self.last_time_in = time_in;
+            let ds = if p.tap_delay_s > 0.0 {
+                p.tap_delay_s.clamp(MIN_DELAY_S, MAX_DELAY_S)
+            } else {
+                MIN_DELAY_S * powf(MAX_DELAY_S / MIN_DELAY_S, p.time_time())
+            };
+            self.target_delay = (ds * self.fs).clamp(1.0, (self.delay.len() - 2) as f32);
+        }
 
         self.fb_target = match self.mode {
             TimeMode::TapeSlip => 0.86 + 0.12 * p.time_repeats(),
@@ -113,8 +140,15 @@ impl TimeEngine {
 
         self.warble.set_amount(p.time_warble());
         self.bbd.set_noise(0.0005 + self.drive * 0.003);
-        self.bbd
-            .set_time(self.cur_delay / self.fs, self.fb_target.min(1.0));
+
+        // BBD bandwidth tracks the (slewing) delay and feedback, but the expf
+        // pair inside set_time only reruns for a >1 % change.
+        let fb = self.fb_target.min(1.0);
+        let (last_d, last_fb) = self.last_bbd_in;
+        if (self.cur_delay - last_d).abs() > 0.01 * self.cur_delay || fb != last_fb {
+            self.last_bbd_in = (self.cur_delay, fb);
+            self.bbd.set_time(self.cur_delay / self.fs, fb);
+        }
     }
 
     /// Current looper transport state (for LED feedback).
@@ -155,7 +189,7 @@ impl TimeEngine {
         let w = self.warble.process(); // [-1,1] × amount
         let mut mod_frac = w * 0.02 + vib; // ±2% wow/flutter + movement vibrato
         if self.mode == TimeMode::TapeSlip {
-            self.slip_phase += SLIP_DRIFT_HZ / self.fs;
+            self.slip_phase += self.slip_inc;
             if self.slip_phase >= 1.0 {
                 self.slip_phase -= 1.0;
             }
@@ -213,7 +247,11 @@ impl TimeEngine {
     }
 
     fn clear_loop(&mut self) {
-        self.delay.clear_region(0, self.loop_len);
+        // No buffer zeroing: it ran inside the control loop's critical section
+        // and blanked up to 96 k SDRAM words with interrupts masked — a
+        // guaranteed multi-block audio dropout on every clear. Resetting the
+        // bookkeeping suffices: Empty never plays the buffer, and a new
+        // recording overwrites [0, rec_pos) before close_loop exposes it.
         self.loop_len = 0;
         self.loop_pos = 0;
         self.rec_pos = 0;

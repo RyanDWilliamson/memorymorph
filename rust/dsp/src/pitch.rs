@@ -15,6 +15,10 @@ pub struct OctaveUp {
     buf: &'static mut [f32],
     wp: usize,
     phase: f32, // [0,1): position of grain 1 within the window
+    /// Precomputed `(RATIO - 1) / len` (hoists a per-sample divide).
+    phase_inc: f32,
+    /// Precomputed `len as f32`.
+    nf: f32,
 }
 
 impl OctaveUp {
@@ -22,10 +26,13 @@ impl OctaveUp {
         for s in buf.iter_mut() {
             *s = 0.0;
         }
+        let n = buf.len();
         Self {
             buf,
             wp: 0,
             phase: 0.0,
+            phase_inc: (RATIO - 1.0) / n as f32,
+            nf: n as f32,
         }
     }
 
@@ -39,7 +46,7 @@ impl OctaveUp {
         }
 
         // Grain phase decreases so the read head approaches the write head.
-        self.phase -= (RATIO - 1.0) / n as f32;
+        self.phase -= self.phase_inc;
         if self.phase < 0.0 {
             self.phase += 1.0;
         }
@@ -49,23 +56,21 @@ impl OctaveUp {
             self.phase + 0.5
         };
 
-        let nf = n as f32;
-        let g1 = self.read_behind(self.phase * nf);
-        let g2 = self.read_behind(p2 * nf);
+        let g1 = self.read_behind(self.phase * self.nf);
+        let g2 = self.read_behind(p2 * self.nf);
         // Triangular windows offset by half a window sum to 1.
         g1 * tri(self.phase) + g2 * tri(p2)
     }
 
     /// Interpolated read `behind` samples before the write head.
+    /// `behind ∈ [0, len)` (phases are kept in [0,1)), so `rp` is out of range
+    /// by at most one period — a single conditional wrap suffices.
     #[inline]
     fn read_behind(&self, behind: f32) -> f32 {
         let n = self.buf.len();
         let mut rp = self.wp as f32 - behind;
-        while rp < 0.0 {
-            rp += n as f32;
-        }
-        while rp >= n as f32 {
-            rp -= n as f32;
+        if rp < 0.0 {
+            rp += self.nf;
         }
         let i0 = rp as usize;
         let frac = rp - i0 as f32;

@@ -15,6 +15,8 @@ pub struct Warble {
     flutter_phase: f32,
     flutter_inc: f32,
     amount: f32,
+    /// Cached `0.15 + 0.35·amount` (hoists per-sample arithmetic).
+    flutter_share: f32,
 }
 
 impl Warble {
@@ -25,12 +27,14 @@ impl Warble {
             flutter_phase: 0.37, // offset so wow & flutter don't start aligned
             flutter_inc: 8.0 / fs, // 8 Hz flutter
             amount: 0.0,
+            flutter_share: 0.15,
         }
     }
 
     /// 0..1 modulation depth (the Warble knob). 0 = rock-steady pitch.
     pub fn set_amount(&mut self, amount: f32) {
         self.amount = amount.clamp(0.0, 1.0);
+        self.flutter_share = 0.15 + 0.35 * self.amount; // 0.15..0.50
     }
 
     /// Optionally retune the two rates (Hz), e.g. for the tape-speed toggle.
@@ -56,8 +60,7 @@ impl Warble {
             self.flutter_phase -= 1.0;
         }
 
-        let flutter_share = 0.15 + 0.35 * self.amount; // 0.15..0.50
-        let m = wow * (1.0 - flutter_share) + flutter * flutter_share;
+        let m = wow * (1.0 - self.flutter_share) + flutter * self.flutter_share;
         m * self.amount
     }
 }

@@ -27,6 +27,8 @@ pub struct MovementEngine {
     shape: Shape,
     depth: f32,
     cur: f32, // last unipolar LFO value [0,1]
+    /// Rate-knob value the LFO rate was last computed for (powf memoization).
+    last_rate_knob: f32,
 }
 
 impl MovementEngine {
@@ -38,12 +40,17 @@ impl MovementEngine {
             shape: Shape::Sine,
             depth: 0.0,
             cur: 0.5,
+            last_rate_knob: f32::NAN, // force first computation
         }
     }
 
     pub fn set_params(&mut self, p: &Params) {
-        let rate = MIN_RATE_HZ * powf(MAX_RATE_HZ / MIN_RATE_HZ, p.movement_rate());
-        self.lfo.set_rate(rate);
+        let rate_knob = p.movement_rate();
+        if rate_knob != self.last_rate_knob {
+            self.last_rate_knob = rate_knob;
+            let rate = MIN_RATE_HZ * powf(MAX_RATE_HZ / MIN_RATE_HZ, rate_knob);
+            self.lfo.set_rate(rate);
+        }
         self.shape = Shape::from_knob(p.movement_shape());
         self.lfo.set_shape(self.shape);
         self.depth = p.movement_depth();

@@ -49,7 +49,10 @@ impl PagedKnobs {
         let mut out = [[0.0f32; 6]; 3];
         for (pg, row) in out.iter_mut().enumerate() {
             for (i, v) in row.iter_mut().enumerate() {
-                *v = self.slots[pg][i].value();
+                // Quantize to 1/512 steps: swallows ADC noise (so equality-based
+                // block-rate memoization in the engines actually hits) while
+                // staying well below audible parameter resolution.
+                *v = dsp::fastmath::round(self.slots[pg][i].value() * 512.0) / 512.0;
             }
         }
         out

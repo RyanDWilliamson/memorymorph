@@ -1,16 +1,16 @@
 //! Driftwood — Hothouse (Daisy Seed) firmware.
 //!
-//! Phase 1 scaffold: the control surface, knob paging (TOGGLE_1: TIME / MASTER /
-//! SPACE) with soft-takeover, footswitches, LEDs and DFU are fully wired; the
-//! audio path is a clean pass-through with the MASTER output-level knob and true
-//! bypass. Modeled engines (BBD/tape TIME, PT2399 SPACE, MOVEMENT) land in later
-//! phases.
+//! Full dual-engine pedal: `IN → TIME (BBD delay / tape-slip / looper) →
+//! SPACE (PT2399 reverb) → OUT`, animated by the MOVEMENT LFO. Six knobs are
+//! paged by TOGGLE_1 with soft-takeover; tap tempo, freeze/havoc and the looper
+//! transport share FOOTSWITCH_1 (mode-dependent).
 //!
 //! Control map (see rust/docs/driftwood-plan.md for the full knob-family table):
 //!   TOGGLE_1 PAGE (up=TIME / mid=MASTER / down=SPACE) ·
 //!   TOGGLE_2 TIME mode (up=Looper / mid=Delay / down=Tape-slip) ·
 //!   TOGGLE_3 SPACE character (up=Dark / mid=Modulated / down=Shimmer).
-//!   FOOTSWITCH_1 = tap / hold-freeze (freeze wired; tap = Phase 3) ·
+//!   FOOTSWITCH_1 (delay modes) = tap tempo · hold = freeze/havoc;
+//!   FOOTSWITCH_1 (looper) = record→play→overdub · hold = stop/clear.
 //!   FOOTSWITCH_2 = bypass (LED_2 = effect active).
 //!   DFU: BOTH footswitches + KNOB_5 fully dry, held ~1.5 s.
 
@@ -41,15 +41,18 @@ const TIME_SAMPLES: usize = 96_000;
 /// Shimmer pitch-shifter window (SPACE engine).
 const SHIMMER_SAMPLES: usize = 2_048;
 
-// FOOTSWITCH_1 timing (delay modes): a press shorter than TAP_PRESS_MAX is a
-// tap; held past FREEZE_HOLD it becomes a momentary freeze. Valid tap intervals
-// map directly to delay time.
+// FOOTSWITCH_1 timing (delay modes): a press shorter than FREEZE_HOLD is a
+// tap; held past it, the press becomes a momentary freeze (and is NOT a tap —
+// the two gestures are disjoint by construction). Valid tap intervals map
+// directly to delay time.
 const FREEZE_HOLD_MS: u32 = 350;
-const TAP_PRESS_MAX_MS: u32 = 600;
 const TAP_MIN_MS: u32 = 100;
 const TAP_MAX_MS: u32 = 1_200;
-/// Knob movement (resolved TIME-time) beyond this releases tap-tempo override.
-const KNOB_MOVE_EPS: f32 = 0.01;
+/// Knob movement (resolved TIME-time) beyond this releases the tap-tempo
+/// override. Must exceed the soft-takeover catch window (±0.02 in
+/// `dsp::takeover`), or a page flip that snaps a knob within the catch window
+/// would silently cancel the tap.
+const KNOB_MOVE_EPS: f32 = 0.03;
 
 // ── Lock-up diagnostics ─────────────────────────────────────────────────────
 // The pedal locks with digital artifacts when engaged; the LEDs report the
@@ -149,9 +152,9 @@ fn main() -> ! {
     let mut heartbeat = clock.now_cycles();
     let mut bypass = true;
 
-    // FOOTSWITCH_1 tap / freeze state.
-    let mut fs1_held = false;
-    let mut fs1_press_at = clock.now_cycles();
+    // FOOTSWITCH_1 tap / freeze state. Held/press-duration tracking lives in
+    // FootswitchTracker (debounced); only the gesture interpretation is here.
+    let mut freeze_latched = false;
     let mut last_tap_at: Option<u32> = None;
     let mut tap_delay_s = 0.0f32;
     let mut prev_time_knob = Params::DEFAULT_KNOBS[Page::Time.index()][0];
@@ -165,27 +168,20 @@ fn main() -> ! {
         }
 
         let events = footswitches.update(state.footswitches, &clock);
-        // FOOTSWITCH_2 = bypass.
-        if let FootswitchEvent::Released = events[1] {
+        // FOOTSWITCH_2 = bypass, toggled on PRESS: immediate response, and
+        // immune to the tracker's Released-suppression after a ≥2 s rest of
+        // the foot (which would swallow a release-triggered toggle entirely).
+        if let FootswitchEvent::Pressed = events[1] {
             bypass = !bypass;
         }
 
-        // Track FOOTSWITCH_1 press timing from the debounced edges.
-        match events[0] {
-            FootswitchEvent::Pressed => {
-                fs1_held = true;
-                fs1_press_at = clock.now_cycles();
+        // Expire a stale first tap. Checked every tick so it can never survive
+        // to the DWT wrap (~8.9 s), where a later tap would alias into the
+        // valid window and jump the delay to a random time.
+        if let Some(prev) = last_tap_at {
+            if clock.elapsed_ms(prev) > TAP_MAX_MS {
+                last_tap_at = None;
             }
-            FootswitchEvent::Released => fs1_held = false,
-            _ => {}
-        }
-        // The tracker suppresses the Released event after a LongPress (so a
-        // freeze-hold doesn't also register as a tap) — which left fs1_held
-        // latched true forever after any ≥2 s hold, i.e. a permanently frozen,
-        // self-oscillating delay ("sounds like a loop"). The raw switch state
-        // always clears the hold.
-        if !state.footswitches[0] {
-            fs1_held = false;
         }
 
         // FOOTSWITCH_1 is mode-dependent (TOGGLE_2). In LOOPER it is the
@@ -195,6 +191,7 @@ fn main() -> ! {
         let time_mode = TimeMode::from_toggle(state.toggles[1]);
         let mut freeze = false;
         if let TimeMode::Looper = time_mode {
+            freeze_latched = false;
             let cmd = match events[0] {
                 FootswitchEvent::Released => Some(LooperInput::ShortPress),
                 FootswitchEvent::LongPress => Some(LooperInput::Hold),
@@ -208,8 +205,10 @@ fn main() -> ! {
                 });
             }
         } else {
+            // A release counts as a tap only if the press stayed under the
+            // freeze threshold — tap and freeze gestures are disjoint.
             if let FootswitchEvent::Released = events[0] {
-                if clock.elapsed_ms(fs1_press_at) < TAP_PRESS_MAX_MS {
+                if footswitches.hold_ms(0, &clock) < FREEZE_HOLD_MS {
                     let now = clock.now_cycles();
                     if let Some(prev) = last_tap_at {
                         let interval = clock.elapsed_ms(prev);
@@ -225,7 +224,12 @@ fn main() -> ! {
                     last_tap_at = Some(now);
                 }
             }
-            freeze = fs1_held && clock.elapsed_ms(fs1_press_at) >= FREEZE_HOLD_MS;
+            // Freeze latches once the (debounced) hold passes the threshold
+            // and stays until release — the latch makes holds longer than the
+            // ~8.9 s DWT wrap immune to elapsed-time aliasing.
+            freeze_latched = footswitches.is_held(0)
+                && (freeze_latched || footswitches.hold_ms(0, &clock) >= FREEZE_HOLD_MS);
+            freeze = freeze_latched;
         }
 
         // Resolve the paged knobs (soft-takeover) and publish for the ISR.
@@ -249,30 +253,34 @@ fn main() -> ! {
         };
         cortex_m::interrupt::free(|cs| PARAMS.borrow(cs).set(params));
 
-        // LED1 = state indicator (the ISR overrun meter overrides it while an
-        // overrun is recent). Decode:
-        //   delay modes: solid = FREEZE is active (if this is on and you are
-        //                not holding FS1, the switch reads stuck-pressed)
+        // LED1 = state indicator. Decode:
+        //   any mode:    solid while the ISR overrun meter holds → CPU overrun
+        //   delay modes: solid = FREEZE is active, or (DIAGNOSTIC) the codec
+        //                sees input level — a silent pedal reports which side
+        //                of the codec is dead
         //   looper:      solid = recording/overdubbing · blink = loop playing
-        let lstate = cortex_m::interrupt::free(|cs| {
-            ENGINE
-                .borrow(cs)
-                .borrow_mut()
-                .as_mut()
-                .map(|e| e.looper_state())
-        });
         let led1 = if let TimeMode::Looper = time_mode {
+            // Only the looper needs the engine's transport state; skip the
+            // critical section entirely in the delay modes.
+            let lstate = cortex_m::interrupt::free(|cs| {
+                ENGINE
+                    .borrow(cs)
+                    .borrow_mut()
+                    .as_mut()
+                    .map(|e| e.looper_state())
+            });
             match lstate {
                 Some(LooperState::Recording) | Some(LooperState::Overdubbing) => true,
                 Some(LooperState::Playing) => (clock.elapsed_ms(heartbeat) / 250).is_multiple_of(2),
                 _ => false,
             }
         } else {
-            // DIAGNOSTIC: LED1 also lights while the codec sees input level,
-            // so a silent pedal reports which side of the codec is dead.
             freeze || INPUT_HOLD.load(Ordering::Relaxed) > 0
         };
-        controls.set_led(0, led1);
+        // Including the overrun hold here keeps the meter SOLID when the main
+        // loop is alive; the ISR's raw write only matters when this loop is
+        // starved and cannot run.
+        controls.set_led(0, led1 || OVERRUN_HOLD.load(Ordering::Relaxed) > 0);
         controls.set_led(1, !bypass); // LED2 = effect active
 
         if clock.elapsed_ms(heartbeat) >= 500 {
@@ -315,49 +323,30 @@ fn DMA1_STR1() {
     };
     INPUT_HOLD.store(ih, Ordering::Relaxed);
     let dt = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0);
-    // Live overrun meter on LED1 (PA5): forces LED1 on while an overrun is
-    // recent (survives a starved main loop) and releases it back to the main
-    // loop's freeze/looper indication otherwise (writes only on the 1→0 edge).
-    let prev = OVERRUN_HOLD.load(Ordering::Relaxed);
+    // Live overrun meter: the main loop renders OVERRUN_HOLD on LED1. The ISR
+    // additionally raw-SETS the pin (never clears) so the report still appears
+    // when a sustained overrun starves the main loop — the one situation the
+    // main loop cannot report. (Deliberate, documented deviation from the
+    // "LED updates belong in the main loop" rule, for exactly that reason.)
     let hold = if dt > BLOCK_BUDGET_CYCLES {
+        unsafe { (*pac::GPIOA::PTR).bsrr.write(|w| w.bs5().set_bit()) };
         OVERRUN_HOLD_BLOCKS
     } else {
-        prev.saturating_sub(1)
+        OVERRUN_HOLD.load(Ordering::Relaxed).saturating_sub(1)
     };
     OVERRUN_HOLD.store(hold, Ordering::Relaxed);
-    unsafe {
-        let gpioa = &*pac::GPIOA::PTR;
-        if hold > 0 {
-            gpioa.bsrr.write(|w| w.bs5().set_bit());
-        } else if prev > 0 {
-            gpioa.bsrr.write(|w| w.br5().set_bit());
-        }
-    }
 }
 
 // ── Failure-mode reporters (see the diagnostics comment near the top) ────────
-
-/// Drive LED1 (PA5) / LED2 (PA4) from a context where the HAL is unavailable.
-unsafe fn raw_leds(led1: bool, led2: bool) {
-    let gpioa = &*pac::GPIOA::PTR;
-    gpioa.bsrr.write(|w| {
-        let w = if led1 { w.bs5().set_bit() } else { w.br5().set_bit() };
-        if led2 {
-            w.bs4().set_bit()
-        } else {
-            w.br4().set_bit()
-        }
-    });
-}
 
 /// Rust panic → both LEDs strobe together (~10 Hz).
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     cortex_m::interrupt::disable();
     loop {
-        unsafe { raw_leds(true, true) };
+        unsafe { board::raw_leds(true, true) };
         cortex_m::asm::delay(24_000_000); // ~50 ms @ 480 MHz
-        unsafe { raw_leds(false, false) };
+        unsafe { board::raw_leds(false, false) };
         cortex_m::asm::delay(24_000_000);
     }
 }
@@ -367,9 +356,9 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
     cortex_m::interrupt::disable();
     loop {
-        raw_leds(true, false);
+        board::raw_leds(true, false);
         cortex_m::asm::delay(24_000_000);
-        raw_leds(false, true);
+        board::raw_leds(false, true);
         cortex_m::asm::delay(24_000_000);
     }
 }

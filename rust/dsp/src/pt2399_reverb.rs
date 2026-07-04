@@ -20,7 +20,7 @@
 //!
 //! Pure `libm` math; host-tested under `cargo test`.
 
-use crate::fastmath;
+use crate::fastmath::{self, soft_clip};
 use crate::onepole::OnePole;
 
 /// Comb delay tunings (samples @ 44.1 kHz, Freeverb-derived); scaled to `fs`.
@@ -182,8 +182,12 @@ impl Pt2399Reverb {
             self.combs[c].mod_cached =
                 self.mod_depth * 0.5 * (1.0 + fastmath::sin_01(phase));
         }
+        // Reading at `idx` (just before writing it) is the full comb delay
+        // `len`; adding the modulation offset shortens it to `len - mod_samp`.
+        // (`idx - mod_samp` would be a delay of only `mod_samp` samples — the
+        // combs collapse to sub-millisecond metallic resonators.)
         let mod_samp = self.combs[c].mod_cached;
-        let read = self.combs[c].idx as f32 - mod_samp;
+        let read = self.combs[c].idx as f32 + mod_samp;
         let out = self.read_frac(offset, len, read);
 
         // Damping low-pass in the feedback, then PT2399 grit.
@@ -193,7 +197,10 @@ impl Pt2399Reverb {
 
         let idx = self.combs[c].idx;
         self.mem[offset + idx] = input + fed * self.feedback;
-        self.combs[c].idx = (idx + 1) % len;
+        // Compare-wrap instead of `%` — len is not a power of two, so the
+        // modulo costs a hardware divide per comb per sample.
+        let next = idx + 1;
+        self.combs[c].idx = if next == len { 0 } else { next };
 
         // Advance the LFO phase every sample (cheap); the sine itself is only
         // evaluated on refresh ticks.
@@ -216,23 +223,21 @@ impl Pt2399Reverb {
         let buf = self.mem[offset + idx];
         let out = -x + buf;
         self.mem[offset + idx] = x + buf * ALLPASS_FB;
-        self.allpasses[a].idx = (idx + 1) % len;
+        let next = idx + 1;
+        self.allpasses[a].idx = if next == len { 0 } else { next };
         out
     }
 
-    /// Linear-interpolated read of `pos` (in samples, may be fractional and
-    /// outside [0,len)) within the comb region `[offset, offset+len)`.
+    /// Linear-interpolated read of `pos` (in samples, fractional, in
+    /// `[0, 2·len)` — i.e. at most one wrap past the end) within the comb
+    /// region `[offset, offset+len)`. Callers guarantee the bound: the only
+    /// out-of-range excursion is `idx + mod_samp` with `mod_samp ≤ 28 ≪ len`.
     #[inline]
     fn read_frac(&self, offset: usize, len: usize, pos: f32) -> f32 {
         let lenf = len as f32;
-        let mut p = pos;
-        while p < 0.0 {
-            p += lenf;
-        }
-        while p >= lenf {
-            p -= lenf;
-        }
-        // p ∈ [0, len) after the wraps above, so integer truncation == floor.
+        let p = if pos >= lenf { pos - lenf } else { pos };
+        debug_assert!((0.0..lenf).contains(&p));
+        // p ∈ [0, len), so integer truncation == floor.
         let i0 = p as usize;
         let frac = p - i0 as f32;
         let i1 = if i0 + 1 >= len { 0 } else { i0 + 1 };
@@ -270,13 +275,6 @@ fn mk_allpass((offset, len): (usize, usize)) -> Allpass {
 #[inline]
 fn quantize(x: f32, levels: f32) -> f32 {
     fastmath::round(x * levels) / levels
-}
-
-/// Waveform-preserving soft clip for the dirty feedback path.
-#[inline]
-fn soft_clip(x: f32) -> f32 {
-    let x = x.clamp(-1.6, 1.6);
-    x - (x * x * x) * (1.0 / 6.75)
 }
 
 #[cfg(test)]
@@ -346,6 +344,36 @@ mod tests {
             energy(0.9) > energy(0.3),
             "more decay should ring longer"
         );
+    }
+
+    #[test]
+    fn modulated_combs_keep_their_delay() {
+        // Regression: the modulated tap read `idx - mod_samp`, collapsing every
+        // comb to a `mod_samp`-sample (≤28) delay whenever modulation was
+        // active. Correct combs cannot produce output before the shortest comb
+        // delay (~2429 samples @96k, minus the ≤28-sample modulation).
+        let mut r = mk();
+        r.set_decay(0.6);
+        r.set_tone(0.6);
+        r.set_mod(1.0);
+        r.set_rate(1.0);
+        let _ = r.process(1.0, 0.0); // impulse
+        let min_comb = (1116.0 * (FS / 44_100.0)) as usize; // shortest comb, scaled
+        let mut early_peak = 0.0f32;
+        for _ in 0..(min_comb - 64) {
+            early_peak = early_peak.max(r.process(0.0, 0.0).abs());
+        }
+        assert!(
+            early_peak < 1.0e-4,
+            "output before the shortest comb delay means the modulated tap \
+             reads the wrong side of the write head, early peak {early_peak}"
+        );
+        // …and the tail must still arrive after it.
+        let mut tail_peak = 0.0f32;
+        for _ in 0..(FS as usize / 4) {
+            tail_peak = tail_peak.max(r.process(0.0, 0.0).abs());
+        }
+        assert!(tail_peak > 1.0e-3, "reverb tail missing, peak {tail_peak}");
     }
 
     #[test]

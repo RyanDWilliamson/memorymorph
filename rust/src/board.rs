@@ -120,6 +120,22 @@ impl FootswitchTracker {
         }
     }
 
+    /// Debounced held state of a footswitch (true while pressed). Unlike the
+    /// event stream, this is level-triggered and unaffected by the
+    /// Released-suppression that follows a long press.
+    #[inline]
+    pub fn is_held(&self, i: usize) -> bool {
+        self.debounced[i]
+    }
+
+    /// How long the switch has been held, in ms. Only meaningful while
+    /// [`is_held`](Self::is_held) is true; the DWT counter wraps every ~8.9 s,
+    /// so callers timing longer holds must latch their own state.
+    #[inline]
+    pub fn hold_ms(&self, i: usize, clock: &Clock) -> u32 {
+        clock.elapsed_ms(self.press_start_cycles[i])
+    }
+
     /// Feed the current raw footswitch readings and the clock; returns a
     /// per-footswitch event. Call every control tick.
     pub fn update(&mut self, raw: [bool; 2], clock: &Clock) -> [FootswitchEvent; 2] {
@@ -265,6 +281,26 @@ fn toggle_pos(up_low: bool, down_low: bool) -> TogglePosition {
     } else {
         TogglePosition::Middle
     }
+}
+
+/// Drive LED1 (PA5) / LED2 (PA4) by raw register access, for contexts where the
+/// HAL `Controls` is unavailable (panic/fault handlers, ISR diagnostics). Owns
+/// the LED pin knowledge together with `Controls::new`'s pin table — keep them
+/// in sync if the board layout ever changes.
+///
+/// # Safety
+/// Bypasses pin ownership; the pins must already be configured as outputs
+/// (done by `Controls::new`) or the writes are inert.
+pub unsafe fn raw_leds(led1: bool, led2: bool) {
+    let gpioa = &*hal::pac::GPIOA::PTR;
+    gpioa.bsrr.write(|w| {
+        let w = if led1 { w.bs5().set_bit() } else { w.br5().set_bit() };
+        if led2 {
+            w.bs4().set_bit()
+        } else {
+            w.br4().set_bit()
+        }
+    });
 }
 
 /// Hold time for the footswitch DFU gesture.

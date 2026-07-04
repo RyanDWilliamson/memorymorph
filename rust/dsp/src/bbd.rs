@@ -28,7 +28,7 @@
 //!
 //! Pure `libm` math; host-tested under `cargo test`.
 
-use crate::fastmath;
+use crate::fastmath::{self, soft_clip};
 use crate::onepole::OnePole;
 
 /// Effective BBD stage count — sets how the clock (and therefore bandwidth)
@@ -117,7 +117,7 @@ impl Bbd {
     /// darkening and the freeze/havoc clip-limit are preserved.
     #[inline]
     pub fn pre_mix(&mut self, x: f32, feedback_compressed: f32) -> f32 {
-        self.comp_env += self.env_coeff * (abs(x) - self.comp_env);
+        self.comp_env += self.env_coeff * (x.abs() - self.comp_env);
         let gain = fastmath::sqrt(REF / (self.comp_env + ENV_EPS)).clamp(0.5, 6.0);
         let compressed = soft_clip(x * gain + feedback_compressed);
         self.pre_lp.process(compressed)
@@ -128,7 +128,7 @@ impl Bbd {
     pub fn post(&mut self, x: f32) -> f32 {
         let filtered = self.post_lp.process(x);
         let noisy = filtered + self.white() * self.noise_amt;
-        self.exp_env += self.env_coeff * (abs(noisy) - self.exp_env);
+        self.exp_env += self.env_coeff * (noisy.abs() - self.exp_env);
         let gain = fastmath::sqrt((self.exp_env + ENV_EPS) / REF).clamp(0.1, 2.0);
         noisy * gain
     }
@@ -139,23 +139,6 @@ impl Bbd {
         self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         (self.rng >> 9) as f32 / (1 << 23) as f32 * 2.0 - 1.0
     }
-}
-
-#[inline]
-fn abs(x: f32) -> f32 {
-    if x < 0.0 {
-        -x
-    } else {
-        x
-    }
-}
-
-/// Gentle odd-symmetric soft clip (charge-transfer nonlinearity). Cheap cubic
-/// soft clip — preserves waveform shape, unlike a flat tanh.
-#[inline]
-fn soft_clip(x: f32) -> f32 {
-    let x = x.clamp(-1.6, 1.6);
-    x - (x * x * x) * (1.0 / 6.75)
 }
 
 #[cfg(test)]

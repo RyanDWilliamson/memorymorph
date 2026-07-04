@@ -13,8 +13,8 @@ pub fn sin_01(phase: f32) -> f32 {
     // Map to t ∈ [-0.5, 0.5) with sin(2π·phase) = sin(2π·t).
     let t = if phase < 0.5 { phase } else { phase - 1.0 };
     // Parabola through the zeros/peak, then odd refinement.
-    let y = 8.0 * t - 16.0 * t * abs(t);
-    let y = 0.225 * (y * abs(y) - y) + y;
+    let y = 8.0 * t - 16.0 * t * t.abs();
+    let y = 0.225 * (y * y.abs() - y) + y;
     y.clamp(-1.0, 1.0)
 }
 
@@ -39,9 +39,13 @@ pub fn round(x: f32) -> f32 {
     ((x + h) as i32) as f32
 }
 
+/// Gentle odd-symmetric cubic soft clip (the charge-transfer nonlinearity used
+/// by both the BBD and PT2399 models). Waveform-preserving, monotonic over the
+/// clamp range; output bounded to ±(1.6 − 1.6³/6.75) ≈ ±0.993.
 #[inline]
-fn abs(x: f32) -> f32 {
-    f32::from_bits(x.to_bits() & 0x7fff_ffff)
+pub fn soft_clip(x: f32) -> f32 {
+    let x = x.clamp(-1.6, 1.6);
+    x - (x * x * x) * (1.0 / 6.75)
 }
 
 #[cfg(test)]

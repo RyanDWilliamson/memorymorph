@@ -21,7 +21,6 @@ const BLOOM_REGEN: f32 = 0.85;
 pub struct SpaceEngine {
     reverb: Pt2399Reverb,
     shimmer: OctaveUp,
-    mode: SpaceMode,
     mix: f32,
     regen: f32,
     shimmer_amt: f32,
@@ -38,7 +37,6 @@ impl SpaceEngine {
         Self {
             reverb: Pt2399Reverb::new(fs, reverb_buf),
             shimmer: OctaveUp::new(shimmer_buf),
-            mode: SpaceMode::Modulated,
             mix: 0.3,
             regen: 0.0,
             shimmer_amt: 0.0,
@@ -46,16 +44,19 @@ impl SpaceEngine {
         }
     }
 
-    /// Map parameters once per block; `bloom` = FS1-hold.
-    pub fn set_params(&mut self, p: &Params, bloom: bool) {
-        self.mode = p.space_mode;
+    /// Map parameters once per block. `p.freeze` (FS1-hold) blooms the reverb —
+    /// read directly from `Params` so TIME-freeze and SPACE-bloom can never be
+    /// driven apart by a caller.
+    pub fn set_params(&mut self, p: &Params) {
+        let bloom = p.freeze;
+        let mode = p.space_mode;
         self.mix = p.space_mix();
 
         self.reverb.set_decay(if bloom { 1.0 } else { p.space_decay() });
         self.reverb.set_age(p.space_age());
 
         // Character toggle shapes tone/modulation and enables shimmer.
-        let (tone_scale, mod_scale, shimmer_on) = match self.mode {
+        let (tone_scale, mod_scale, shimmer_on) = match mode {
             SpaceMode::Dark => (0.45, 0.4, false),
             SpaceMode::Modulated => (0.8, 1.0, false),
             SpaceMode::Shimmer => (0.9, 0.6, true),
