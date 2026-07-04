@@ -71,6 +71,17 @@ const BLOCK_BUDGET_CYCLES: u32 = CYCLES_PER_SAMPLE * daisy::audio::BLOCK_LENGTH 
 const OVERRUN_HOLD_BLOCKS: u32 = 96_000 / daisy::audio::BLOCK_LENGTH as u32;
 static OVERRUN_HOLD: AtomicU32 = AtomicU32::new(0);
 
+// DIAGNOSTIC (silent-pedal hunt): input-activity meter. The ISR measures the
+// codec's RX peak per block; the main loop lights LED1 while real input level
+// was seen recently. Splits the silence at the codec boundary:
+//   LED1 follows your playing → codec RX works: silence is OUTPUT-side
+//   LED1 dark while playing   → input never reaches the codec: INPUT-side
+/// RX peak above this counts as "signal present" (guitar strum ≈ 0.05–0.5).
+const INPUT_SEEN_LEVEL: f32 = 0.02;
+/// Blocks to hold the indication (~150 ms) so it reads as steady flicker.
+const INPUT_HOLD_BLOCKS: u32 = 14_400 / daisy::audio::BLOCK_LENGTH as u32;
+static INPUT_HOLD: AtomicU32 = AtomicU32::new(0);
+
 static AUDIO_INTERFACE: Mutex<RefCell<Option<audio::Interface>>> = Mutex::new(RefCell::new(None));
 static ENGINE: Mutex<RefCell<Option<DriftwoodEngine>>> = Mutex::new(RefCell::new(None));
 static PARAMS: Mutex<Cell<Params>> = Mutex::new(Cell::new(Params::DEFAULT));
@@ -257,7 +268,9 @@ fn main() -> ! {
                 _ => false,
             }
         } else {
-            freeze
+            // DIAGNOSTIC: LED1 also lights while the codec sees input level,
+            // so a silent pedal reports which side of the codec is dead.
+            freeze || INPUT_HOLD.load(Ordering::Relaxed) > 0
         };
         controls.set_led(0, led1);
         controls.set_led(1, !bypass); // LED2 = effect active
@@ -275,6 +288,7 @@ fn main() -> ! {
 #[interrupt]
 fn DMA1_STR1() {
     let t0 = cortex_m::peripheral::DWT::cycle_count();
+    let mut rx_peak = 0.0f32;
     cortex_m::interrupt::free(|cs| {
         if let Some(audio_interface) = AUDIO_INTERFACE.borrow(cs).borrow_mut().as_mut() {
             let params = PARAMS.borrow(cs).get();
@@ -284,6 +298,7 @@ fn DMA1_STR1() {
                     .handle_interrupt_dma1_str1(|audio_buffer| {
                         for frame in audio_buffer {
                             let (left, _right) = *frame;
+                            rx_peak = rx_peak.max(left.abs());
                             let y = eng.process(left, &params);
                             *frame = (y, y);
                         }
@@ -292,6 +307,13 @@ fn DMA1_STR1() {
             }
         }
     });
+    // Input-activity meter (diagnostic; see the constants above).
+    let ih = if rx_peak > INPUT_SEEN_LEVEL {
+        INPUT_HOLD_BLOCKS
+    } else {
+        INPUT_HOLD.load(Ordering::Relaxed).saturating_sub(1)
+    };
+    INPUT_HOLD.store(ih, Ordering::Relaxed);
     let dt = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0);
     // Live overrun meter on LED1 (PA5): forces LED1 on while an overrun is
     // recent (survives a starved main loop) and releases it back to the main
