@@ -85,6 +85,11 @@ const INPUT_SEEN_LEVEL: f32 = 0.02;
 const INPUT_HOLD_BLOCKS: u32 = 14_400 / daisy::audio::BLOCK_LENGTH as u32;
 static INPUT_HOLD: AtomicU32 = AtomicU32::new(0);
 
+/// Counts audio ISR invocations, so the main loop can tell "ISR runs but the
+/// codec RX is silent" (input-side analog/codec fault) apart from "audio ISR
+/// never fires" (SAI/DMA never started). Rendered as a short LED1 tick.
+static ISR_BLOCKS: AtomicU32 = AtomicU32::new(0);
+
 static AUDIO_INTERFACE: Mutex<RefCell<Option<audio::Interface>>> = Mutex::new(RefCell::new(None));
 static ENGINE: Mutex<RefCell<Option<DriftwoodEngine>>> = Mutex::new(RefCell::new(None));
 static PARAMS: Mutex<Cell<Params>> = Mutex::new(Cell::new(Params::DEFAULT));
@@ -158,6 +163,10 @@ fn main() -> ! {
     let mut last_tap_at: Option<u32> = None;
     let mut tap_delay_s = 0.0f32;
     let mut prev_time_knob = Params::DEFAULT_KNOBS[Page::Time.index()][0];
+
+    // Audio-ISR liveness, sampled on the heartbeat (see ISR_BLOCKS).
+    let mut last_blocks = 0u32;
+    let mut isr_alive = false;
 
     loop {
         let state = controls.read();
@@ -275,7 +284,14 @@ fn main() -> ! {
                 _ => false,
             }
         } else {
-            freeze || INPUT_HOLD.load(Ordering::Relaxed) > 0
+            // DIAGNOSTIC decode (delay modes):
+            //   follows your playing        → codec RX sees signal
+            //   short tick every heartbeat  → audio ISR alive but RX silent
+            //                                 (input-side analog/codec fault)
+            //   fully dark                  → audio ISR never fires (SAI/DMA)
+            freeze
+                || INPUT_HOLD.load(Ordering::Relaxed) > 0
+                || (isr_alive && clock.elapsed_ms(heartbeat) < 60)
         };
         // Including the overrun hold here keeps the meter SOLID when the main
         // loop is alive; the ISR's raw write only matters when this loop is
@@ -286,6 +302,9 @@ fn main() -> ! {
         if clock.elapsed_ms(heartbeat) >= 500 {
             heartbeat = clock.now_cycles();
             led_user.toggle();
+            let b = ISR_BLOCKS.load(Ordering::Relaxed);
+            isr_alive = b != last_blocks;
+            last_blocks = b;
         }
     }
 }
@@ -296,6 +315,7 @@ fn main() -> ! {
 #[interrupt]
 fn DMA1_STR1() {
     let t0 = cortex_m::peripheral::DWT::cycle_count();
+    ISR_BLOCKS.fetch_add(1, Ordering::Relaxed);
     let mut rx_peak = 0.0f32;
     cortex_m::interrupt::free(|cs| {
         if let Some(audio_interface) = AUDIO_INTERFACE.borrow(cs).borrow_mut().as_mut() {
