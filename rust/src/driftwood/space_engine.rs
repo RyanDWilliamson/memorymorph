@@ -6,10 +6,13 @@
 //! - **Shimmer** — an octave-up tail folded into the reverb feedback.
 //!
 //! An outer regeneration loop (SPACE "regen" knob) feeds the wet tail back into
-//! the tank; FS1-hold **bloom** pushes decay and regen toward self-oscillation,
-//! held in check by the reverb's internal soft clip and the engine's output
-//! limiter.
+//! the tank; FS1-hold **bloom** pushes decay and regen toward self-oscillation.
+//! The outer loop recirculates through a soft clip (like the TIME loop through
+//! the BBD's), so loop gain > 1 blooms into a bounded, musical oscillation —
+//! without the clip it grew unbounded to inf, NaN latched in the reverb's
+//! filter states, and the engine went permanently silent (bench-confirmed).
 
+use dsp::fastmath::soft_clip;
 use dsp::pitch::OctaveUp;
 use dsp::pt2399_reverb::Pt2399Reverb;
 
@@ -77,11 +80,19 @@ impl SpaceEngine {
             0.5 * p.space_regen() * (1.0 - 0.6 * p.space_decay())
         };
         self.regen = regen.clamp(0.0, BLOOM_REGEN);
+        // Shimmer injection is part of the same outer loop budget — keep the
+        // sum of regen + shimmer gain below unity at normal settings so only
+        // bloom (deliberately) tips into self-oscillation.
         self.shimmer_amt = if shimmer_on {
-            0.5 * (0.4 + 0.6 * p.space_regen())
+            0.3 * (0.3 + 0.7 * p.space_regen())
         } else {
             0.0
         };
+        // Belt-and-braces: if the tail state was ever poisoned, recover instead
+        // of latching silent.
+        if !self.last_tail.is_finite() {
+            self.last_tail = 0.0;
+        }
     }
 
     /// `send_gain` scales the dry signal into the tank (MOVEMENT swell, space
@@ -93,7 +104,9 @@ impl SpaceEngine {
         } else {
             0.0
         };
-        let send = x * send_gain + self.last_tail * self.regen;
+        // Soft-clip the recirculation: bounds the outer loop so gain > 1 is a
+        // musical bloom, never unbounded growth → inf → NaN-latched silence.
+        let send = soft_clip(x * send_gain + self.last_tail * self.regen);
         let wet = self.reverb.process(send, inject);
         self.last_tail = wet;
         x * (1.0 - self.mix) + wet * self.mix
