@@ -167,9 +167,11 @@ fn main() -> ! {
     let mut tap_delay_s = 0.0f32;
     let mut prev_time_knob = Params::DEFAULT_KNOBS[Page::Time.index()][0];
 
-    // Audio-ISR liveness, sampled on the heartbeat (see ISR_BLOCKS).
+    // Audio-ISR liveness + DMA-error activity, sampled on the heartbeat.
     let mut last_blocks = 0u32;
     let mut isr_alive = false;
+    let mut last_dma_errors = 0u32;
+    let mut dma_erroring = false;
 
     loop {
         let state = controls.read();
@@ -289,11 +291,13 @@ fn main() -> ! {
         } else {
             // DIAGNOSTIC decode (delay modes):
             //   follows your playing        → codec RX sees signal
+            //   fast ~10 Hz flicker         → DMA errors occurring right now
             //   short tick every heartbeat  → audio ISR alive but RX silent
             //                                 (input-side analog/codec fault)
             //   fully dark                  → audio ISR never fires (SAI/DMA)
             freeze
                 || INPUT_HOLD.load(Ordering::Relaxed) > 0
+                || (dma_erroring && (clock.elapsed_ms(heartbeat) / 50).is_multiple_of(2))
                 || (isr_alive && clock.elapsed_ms(heartbeat) < 60)
         };
         // Including the overrun hold here keeps the meter SOLID when the main
@@ -308,6 +312,9 @@ fn main() -> ! {
             let b = ISR_BLOCKS.load(Ordering::Relaxed);
             isr_alive = b != last_blocks;
             last_blocks = b;
+            let e = DMA_ERRORS.load(Ordering::Relaxed);
+            dma_erroring = e != last_dma_errors;
+            last_dma_errors = e;
         }
     }
 }
@@ -341,6 +348,26 @@ fn DMA1_STR1() {
                     .is_err()
                 {
                     DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+                    // The BSP's examine_interrupt only clears the HT/TC flags;
+                    // a latched error flag (TEIF/FEIF/DMEIF) re-fires this ISR
+                    // with neither HT nor TC set → Err on every call, forever:
+                    // the TX buffer freewheels as a steady digital tone and no
+                    // audio passes. Clear ALL stream-1 flags so the stream
+                    // self-heals at the next half/full boundary.
+                    unsafe {
+                        (*pac::DMA1::PTR).lifcr.write(|w| {
+                            w.ctcif1()
+                                .set_bit()
+                                .chtif1()
+                                .set_bit()
+                                .cteif1()
+                                .set_bit()
+                                .cdmeif1()
+                                .set_bit()
+                                .cfeif1()
+                                .set_bit()
+                        });
+                    }
                 }
             }
         }
