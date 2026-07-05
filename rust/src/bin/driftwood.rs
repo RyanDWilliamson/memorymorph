@@ -83,7 +83,11 @@ static OVERRUN_HOLD: AtomicU32 = AtomicU32::new(0);
 const INPUT_SEEN_LEVEL: f32 = 0.02;
 /// Blocks to hold the indication (~150 ms) so it reads as steady flicker.
 const INPUT_HOLD_BLOCKS: u32 = 14_400 / daisy::audio::BLOCK_LENGTH as u32;
+/// Left-channel activity (the channel the chain and bypass consume).
 static INPUT_HOLD: AtomicU32 = AtomicU32::new(0);
+/// Right-channel activity — if the guitar shows up here and not on the left,
+/// the codec channel mapping is swapped relative to the firmware's assumption.
+static INPUT_R_HOLD: AtomicU32 = AtomicU32::new(0);
 
 /// Counts audio ISR invocations, so the main loop can tell "ISR runs but the
 /// codec RX is silent" (input-side analog/codec fault) apart from "audio ISR
@@ -290,13 +294,18 @@ fn main() -> ! {
             }
         } else {
             // DIAGNOSTIC decode (delay modes):
-            //   follows your playing        → codec RX sees signal
+            //   SOLID while you play        → guitar on the LEFT channel (the
+            //                                 one the chain consumes) — good
+            //   2 Hz BLINK while you play   → guitar only on the RIGHT channel
+            //                                 → codec channel mapping swapped
             //   fast ~10 Hz flicker         → DMA errors occurring right now
             //   short tick every heartbeat  → audio ISR alive but RX silent
-            //                                 (input-side analog/codec fault)
             //   fully dark                  → audio ISR never fires (SAI/DMA)
+            let left_in = INPUT_HOLD.load(Ordering::Relaxed) > 0;
+            let right_in = INPUT_R_HOLD.load(Ordering::Relaxed) > 0;
             freeze
-                || INPUT_HOLD.load(Ordering::Relaxed) > 0
+                || left_in
+                || (right_in && (clock.elapsed_ms(heartbeat) / 250).is_multiple_of(2))
                 || (dma_erroring && (clock.elapsed_ms(heartbeat) / 50).is_multiple_of(2))
                 || (isr_alive && clock.elapsed_ms(heartbeat) < 60)
         };
@@ -327,6 +336,7 @@ fn DMA1_STR1() {
     let t0 = cortex_m::peripheral::DWT::cycle_count();
     ISR_BLOCKS.fetch_add(1, Ordering::Relaxed);
     let mut rx_peak = 0.0f32;
+    let mut rx_r_peak = 0.0f32;
     cortex_m::interrupt::free(|cs| {
         if let Some(audio_interface) = AUDIO_INTERFACE.borrow(cs).borrow_mut().as_mut() {
             let params = PARAMS.borrow(cs).get();
@@ -339,8 +349,9 @@ fn DMA1_STR1() {
                 if audio_interface
                     .handle_interrupt_dma1_str1(|audio_buffer| {
                         for frame in audio_buffer {
-                            let (left, _right) = *frame;
+                            let (left, right) = *frame;
                             rx_peak = rx_peak.max(left.abs());
+                            rx_r_peak = rx_r_peak.max(right.abs());
                             let y = eng.process(left, &params);
                             *frame = (y, y);
                         }
@@ -372,13 +383,19 @@ fn DMA1_STR1() {
             }
         }
     });
-    // Input-activity meter (diagnostic; see the constants above).
+    // Input-activity meters, per channel (diagnostic; see the constants above).
     let ih = if rx_peak > INPUT_SEEN_LEVEL {
         INPUT_HOLD_BLOCKS
     } else {
         INPUT_HOLD.load(Ordering::Relaxed).saturating_sub(1)
     };
     INPUT_HOLD.store(ih, Ordering::Relaxed);
+    let irh = if rx_r_peak > INPUT_SEEN_LEVEL {
+        INPUT_HOLD_BLOCKS
+    } else {
+        INPUT_R_HOLD.load(Ordering::Relaxed).saturating_sub(1)
+    };
+    INPUT_R_HOLD.store(irh, Ordering::Relaxed);
     let dt = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(t0);
     // Live overrun meter: the main loop renders OVERRUN_HOLD on LED1. The ISR
     // additionally raw-SETS the pin (never clears) so the report still appears
