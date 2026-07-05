@@ -89,6 +89,9 @@ static INPUT_HOLD: AtomicU32 = AtomicU32::new(0);
 /// codec RX is silent" (input-side analog/codec fault) apart from "audio ISR
 /// never fires" (SAI/DMA never started). Rendered as a short LED1 tick.
 static ISR_BLOCKS: AtomicU32 = AtomicU32::new(0);
+/// Counts skipped blocks from DMA state mismatches (late ISR). Occasional = a
+/// click under load; growing steadily = the chain is over budget.
+static DMA_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 static AUDIO_INTERFACE: Mutex<RefCell<Option<audio::Interface>>> = Mutex::new(RefCell::new(None));
 static ENGINE: Mutex<RefCell<Option<DriftwoodEngine>>> = Mutex::new(RefCell::new(None));
@@ -322,7 +325,11 @@ fn DMA1_STR1() {
             let params = PARAMS.borrow(cs).get();
             if let Some(eng) = ENGINE.borrow(cs).borrow_mut().as_mut() {
                 eng.set_params(&params);
-                audio_interface
+                // A DMA state mismatch (e.g. the ISR ran late once) must be a
+                // one-block glitch, not death: unwrap() here killed the whole
+                // pedal (panic strobe + freewheeling buzz) on the first late
+                // block. Skip the block and count it instead.
+                if audio_interface
                     .handle_interrupt_dma1_str1(|audio_buffer| {
                         for frame in audio_buffer {
                             let (left, _right) = *frame;
@@ -331,7 +338,10 @@ fn DMA1_STR1() {
                             *frame = (y, y);
                         }
                     })
-                    .unwrap();
+                    .is_err()
+                {
+                    DMA_ERRORS.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
     });

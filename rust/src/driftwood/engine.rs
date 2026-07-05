@@ -80,9 +80,15 @@ impl DriftwoodEngine {
 }
 
 /// Waveform-preserving soft limiter (monotonic over ±1.4) keeping the output
-/// inside the codec's range during freeze/havoc blooms.
+/// inside the codec's range during freeze/havoc blooms. Also the chain's NaN
+/// firewall: `clamp` passes NaN through untouched, and a NaN reaching the codec
+/// converts to 0 — a silently muted pedal. Better one zeroed sample than a
+/// poisoned feedback chain presenting as "no audio".
 #[inline]
 fn soft_limit(x: f32) -> f32 {
+    if !x.is_finite() {
+        return 0.0;
+    }
     let a = x.clamp(-1.4, 1.4);
     a - (a * a * a) * (1.0 / 6.0)
 }
