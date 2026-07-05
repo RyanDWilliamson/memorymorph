@@ -352,7 +352,11 @@ fn DMA1_STR1() {
                             let (left, right) = *frame;
                             rx_peak = rx_peak.max(left.abs());
                             rx_r_peak = rx_r_peak.max(right.abs());
-                            let y = eng.process(left, &params);
+                            // Mono chain, channel-agnostic: sum both RX
+                            // channels so the guitar gets through regardless
+                            // of which codec channel the Hothouse input lands
+                            // on (unity gain for a single-channel source).
+                            let y = eng.process(left + right, &params);
                             *frame = (y, y);
                         }
                     })
