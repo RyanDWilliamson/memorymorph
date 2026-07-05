@@ -46,5 +46,7 @@ shared vocabulary — terms only, no implementation detail.
   bandwidth, coarse **quantisation** grit (scaled by **Age**), and dirty,
   soft-clipped long decays.
 - **Shimmer** — an octave-up (+12) tail folded into the SPACE reverb feedback.
-- **Regen** — the SPACE engine's outer regeneration loop (wet tail fed back into
-  the tank), distinct from the reverb's internal decay.
+- **Regen** — the SPACE regen knob lifts the reverb's **internal** comb feedback
+  from the decay knob's base toward (never past) unity. There is deliberately no
+  outer feedback loop around the reverb network — that topology is unstable
+  (loop gain multiplies with the network's resonant gain).

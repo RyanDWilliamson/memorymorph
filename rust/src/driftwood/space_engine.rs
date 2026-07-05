@@ -5,12 +5,16 @@
 //! - **Modulated** — seasick wash (deep comb modulation).
 //! - **Shimmer** — an octave-up tail folded into the reverb feedback.
 //!
-//! An outer regeneration loop (SPACE "regen" knob) feeds the wet tail back into
-//! the tank; FS1-hold **bloom** pushes decay and regen toward self-oscillation.
-//! The outer loop recirculates through a soft clip (like the TIME loop through
-//! the BBD's), so loop gain > 1 blooms into a bounded, musical oscillation —
-//! without the clip it grew unbounded to inf, NaN latched in the reverb's
-//! filter states, and the engine went permanently silent (bench-confirmed).
+//! Regeneration is **internal**: the regen knob raises the reverb's own comb
+//! feedback toward (but never past) unity, which is unconditionally stable —
+//! the comb feedback path is damped and passes a soft clip. FS1-hold **bloom**
+//! pushes it just past unity into a bounded, musical self-oscillation.
+//!
+//! An earlier design recirculated the wet tail through an *outer* loop around
+//! the whole network. That topology is inherently unstable: its true loop gain
+//! is `regen × the network's resonant gain` (5–30× near decay resonance), so it
+//! either ran away to inf → NaN-latched silence (unclipped) or a permanent
+//! full-scale scream (clipped). Bench-confirmed both. Don't reintroduce it.
 
 use dsp::fastmath::soft_clip;
 use dsp::pitch::OctaveUp;
@@ -18,20 +22,22 @@ use dsp::pt2399_reverb::Pt2399Reverb;
 
 use super::params::{Params, SpaceMode};
 
-/// Outer-loop regeneration when bloom (FS1-hold) is engaged.
-const BLOOM_REGEN: f32 = 0.85;
+/// Internal comb feedback during bloom (FS1-hold): just past unity, bounded by
+/// the clip inside the comb feedback path.
+const BLOOM_FB: f32 = 1.01;
+/// Comb feedback ceiling reachable with the regen knob (strictly stable).
+const REGEN_FB_MAX: f32 = 0.995;
 
 pub struct SpaceEngine {
     reverb: Pt2399Reverb,
     shimmer: OctaveUp,
     mix: f32,
-    regen: f32,
     shimmer_amt: f32,
     last_tail: f32,
 }
 
 impl SpaceEngine {
-    /// SDRAM the reverb network needs at sample rate `fs`.
+    /// Buffer length the reverb network needs at sample rate `fs`.
     pub fn reverb_len(fs: f32) -> usize {
         Pt2399Reverb::required_len(fs)
     }
@@ -41,7 +47,6 @@ impl SpaceEngine {
             reverb: Pt2399Reverb::new(fs, reverb_buf),
             shimmer: OctaveUp::new(shimmer_buf),
             mix: 0.3,
-            regen: 0.0,
             shimmer_amt: 0.0,
             last_tail: 0.0,
         }
@@ -54,9 +59,17 @@ impl SpaceEngine {
         let bloom = p.freeze;
         let mode = p.space_mode;
         self.mix = p.space_mix();
-
-        self.reverb.set_decay(if bloom { 1.0 } else { p.space_decay() });
         self.reverb.set_age(p.space_age());
+
+        // Regeneration = internal comb feedback. K1 (decay) sets the base tail;
+        // K2 (regen) closes the remaining gap toward REGEN_FB_MAX, never past.
+        let base = 0.70 + 0.29 * p.space_decay();
+        let fb = if bloom {
+            BLOOM_FB
+        } else {
+            base + p.space_regen() * (REGEN_FB_MAX - base)
+        };
+        self.reverb.set_feedback(fb);
 
         // Character toggle shapes tone/modulation and enables shimmer.
         let (tone_scale, mod_scale, shimmer_on) = match mode {
@@ -70,21 +83,14 @@ impl SpaceEngine {
             .set_mod((p.space_mod() * mod_scale).clamp(0.0, 1.0));
         self.reverb.set_rate(0.3 + p.space_mod() * 0.8);
 
-        // Audit: the outer regen loop multiplies with the reverb's internal
-        // comb feedback; near decay resonance the product exceeds unity and the
-        // reverb self-sustains at moderate knob settings. Bound the outer loop
-        // decay-aware — less outer regen headroom as the internal tail grows.
-        let regen = if bloom {
-            BLOOM_REGEN
-        } else {
-            0.5 * p.space_regen() * (1.0 - 0.6 * p.space_decay())
-        };
-        self.regen = regen.clamp(0.0, BLOOM_REGEN);
-        // Shimmer injection is part of the same outer loop budget — keep the
-        // sum of regen + shimmer gain below unity at normal settings so only
-        // bloom (deliberately) tips into self-oscillation.
+        // Shimmer feeds the pitch-shifted tail back through the chip input.
+        // The tank amplifies any injection by its resonant gain ~1/(1-fb), so
+        // the injection budget must scale with the remaining headroom (1-fb):
+        // loop gain stays roughly constant and below unity across the whole
+        // regen range (host regression test covers the worst case). At bloom
+        // (fb > 1) the headroom is zero — bloom is pure tank self-oscillation.
         self.shimmer_amt = if shimmer_on {
-            0.3 * (0.3 + 0.7 * p.space_regen())
+            ((0.3 + 0.7 * p.space_regen()) * (1.0 - fb)).clamp(0.0, 0.15)
         } else {
             0.0
         };
@@ -104,9 +110,10 @@ impl SpaceEngine {
         } else {
             0.0
         };
-        // Soft-clip the recirculation: bounds the outer loop so gain > 1 is a
-        // musical bloom, never unbounded growth → inf → NaN-latched silence.
-        let send = soft_clip(x * send_gain + self.last_tail * self.regen);
+        // Soft-clip the send so a hot TIME stage can't slam the comb inputs.
+        // There is no recirculation here — regeneration lives inside the
+        // reverb's comb feedback (see module docs).
+        let send = soft_clip(x * send_gain);
         let wet = self.reverb.process(send, inject);
         self.last_tail = wet;
         x * (1.0 - self.mix) + wet * self.mix

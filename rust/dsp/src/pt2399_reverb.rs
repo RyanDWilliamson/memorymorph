@@ -122,6 +122,14 @@ impl Pt2399Reverb {
         self.feedback = 0.70 + 0.29 * decay.clamp(0.0, 1.0);
     }
 
+    /// Set the comb feedback directly. Values < 1 are unconditionally stable
+    /// (damped, and the feedback path passes the soft clip + quantiser);
+    /// slightly > 1 gives a **bounded** self-oscillating bloom — the clip in
+    /// the comb feedback path limits it. Clamped to ≤ 1.02.
+    pub fn set_feedback(&mut self, fb: f32) {
+        self.feedback = fb.clamp(0.0, 1.02);
+    }
+
     /// Tone (0..1): 0 = very dark, 1 = as bright as the PT2399 gets (~8 kHz).
     pub fn set_tone(&mut self, tone: f32) {
         let t = tone.clamp(0.0, 1.0);
@@ -146,12 +154,16 @@ impl Pt2399Reverb {
         self.lfo_inc = hz.max(0.0) / self.fs;
     }
 
-    /// Process one mono sample. `feedback_inject` is summed into the comb input
-    /// alongside `x` (used by SHIMMER to fold in a pitch-shifted tail later);
-    /// pass 0.0 when unused.
+    /// Process one mono sample. `feedback_inject` is summed with `x` **before**
+    /// the chip's input bandwidth filter (used by SHIMMER to fold a
+    /// pitch-shifted tail back in); pass 0.0 when unused. Filtering the
+    /// injection is both faithful (everything entering a PT2399 passes its
+    /// input bandwidth) and what keeps shimmer stable: the rising octave
+    /// ladder (+12 → +24 → …) dies at the bandwidth ceiling instead of
+    /// accumulating into a scream.
     #[inline]
     pub fn process(&mut self, x: f32, feedback_inject: f32) -> f32 {
-        let input = self.band.process(x) + feedback_inject;
+        let input = self.band.process(x + feedback_inject);
 
         let refresh_mod = self.mod_tick == 0;
         self.mod_tick += 1;
@@ -374,6 +386,43 @@ mod tests {
             tail_peak = tail_peak.max(r.process(0.0, 0.0).abs());
         }
         assert!(tail_peak > 1.0e-3, "reverb tail missing, peak {tail_peak}");
+    }
+
+    #[test]
+    fn shimmer_injection_stays_bounded_across_the_regen_range() {
+        // Regression for the bench "massive feedback": the tank amplifies any
+        // injection by its resonant gain ~1/(1-fb), so the SpaceEngine scales
+        // the shimmer budget with the remaining headroom:
+        //   amt = (0.3 + 0.7·regen) · 2 · (1 - fb), clamped to 0.3
+        // Verify the whole law stays bounded and decaying at the least-damped
+        // tone, sweeping fb across the regen range (worst case is mid fb where
+        // the budget is largest).
+        use crate::pitch::OctaveUp;
+        for &fb in &[0.80f32, 0.90, 0.95, 0.995] {
+            let mut r = mk();
+            r.set_feedback(fb);
+            r.set_tone(1.0); // least damping = worst case
+            r.set_mod(0.5);
+            let amt = (1.0 * (1.0 - fb)).clamp(0.0, 0.15); // regen knob = 1.0
+            let shim_buf: &'static mut [f32] =
+                Box::leak(vec![0.0f32; 2048].into_boxed_slice());
+            let mut shim = OctaveUp::new(shim_buf);
+            let mut tail = 0.0f32;
+            let mut late_peak = 0.0f32;
+            for n in 0..(FS as usize * 3) {
+                let x = if n < 4800 { 0.5 } else { 0.0 }; // 50 ms burst
+                let inject = shim.process(tail) * amt;
+                tail = r.process(x, inject);
+                assert!(tail.is_finite(), "non-finite tail at fb={fb} n={n}");
+                if n > FS as usize * 2 {
+                    late_peak = late_peak.max(tail.abs());
+                }
+            }
+            assert!(
+                late_peak < 0.5,
+                "tail must decay, fb={fb} late peak {late_peak}"
+            );
+        }
     }
 
     #[test]
