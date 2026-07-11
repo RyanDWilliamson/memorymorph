@@ -220,8 +220,13 @@ impl Pt2399Reverb {
         // as the BBD loop); saturation should engage only near the rail.
         let filt = out * (1.0 - self.damp) + self.combs[c].filt * self.damp;
         self.combs[c].filt = filt;
+        // Age drives the clipper harder WITH make-up (unity net gain): a bare
+        // (1 + drive) multiplier here is loop gain — at default age it pushed
+        // fb×1.2 past unity into genuine self-oscillation (the bench runaway,
+        // gated by the decay knob exactly as loop-gain math predicts).
+        let d = 1.0 + self.drive;
         let fed = quantize(
-            fastmath::knee_clip(filt * (1.0 + self.drive), 0.75),
+            fastmath::knee_clip(filt * d, 0.75) / d,
             self.quant_levels,
         );
 
@@ -456,6 +461,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn age_adds_grit_but_no_loop_gain() {
+        // Regression for THE bench runaway: age's (1+drive) sat inside the
+        // comb feedback as bare loop gain, pushing fb past unity at default
+        // knob settings. With make-up, a high-age high-decay tank must still
+        // decay to silence.
+        let mut r = mk();
+        r.set_feedback(0.90);
+        r.set_age(1.0); // worst case — the configuration no old test covered
+        r.set_tone(0.3); // dark (the bench's Toggle-3-up voicing)
+        r.set_mod(0.1);
+        let _ = r.process(1.0, 0.0);
+        let mut early = 0.0f32;
+        let mut late = 0.0f32;
+        for n in 0..(FS as usize * 3) {
+            let y = r.process(0.0, 0.0).abs();
+            if ((0.2 * FS) as usize..(0.4 * FS) as usize).contains(&n) {
+                early = early.max(y);
+            }
+            if n > FS as usize * 2 {
+                late = late.max(y);
+            }
+        }
+        assert!(
+            late < 0.2 * early,
+            "aged tank must decay: early {early} late {late}"
+        );
     }
 
     #[test]
