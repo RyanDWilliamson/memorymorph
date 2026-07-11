@@ -220,7 +220,7 @@ impl TimeEngine {
         mod_frac *= 1.0 - self.freeze_amt;
 
         let read_samples = self.cur_delay * (1.0 + mod_frac);
-        let read_raw = self.delay.read(read_samples);
+        let read_raw = self.delay.read_cubic(read_samples);
         let wet = self.bbd.post(read_raw);
 
         let fb = self.feedback + (HAVOC_FB - self.feedback) * self.freeze_amt;
