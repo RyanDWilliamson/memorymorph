@@ -45,3 +45,11 @@ values.
 
 The build system is `libDaisy/core/Makefile` (ARM Cortex-M7 toolchain).
 Never edit `libDaisy/` or `DaisySP/` — they are git submodules.
+
+## Rust firmware (branch `driftwood`)
+
+For any work under `rust/`: read `rust/docs/driftwood-agent-guide.md` FIRST
+(non-negotiable DSP invariants, each backed by a regression test), then take
+tasks from `rust/docs/driftwood-next-work.md`. Run
+`cargo test -p dsp --target x86_64-unknown-linux-gnu` (all tests must pass)
+and `cargo clippy --release --bins -- -D warnings` before every commit.

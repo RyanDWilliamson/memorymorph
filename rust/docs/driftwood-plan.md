@@ -1,3 +1,13 @@
+> **STATUS (2026-07-05): largely implemented and playing on hardware.**
+> This document is the original design intent. The as-built truth, including
+> deliberate deviations discovered on the bench, lives in
+> [`driftwood-agent-guide.md`](driftwood-agent-guide.md); pending work is in
+> [`driftwood-next-work.md`](driftwood-next-work.md). Key deviations: the
+> SPACE outer regeneration loop was **removed** (unstable topology — regen is
+> the reverb's internal comb feedback now); FS1 is mode-dependent
+> (tap/freeze vs looper transport); freeze & looper are deprioritized;
+> `DriftwoodEngine::TIME_ONLY` exists as a bench isolation switch.
+
 # Driftwood — New Rust HotHouse Pedal (Design Plan)
 
 ## Context

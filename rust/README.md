@@ -13,9 +13,12 @@ each pedal's engine. Pure, host-testable DSP lives in the `dsp/` crate
 - **Cassette LoFi Junky** — `--bin cassette-lofi-junky` — Gen-Loss-style tape
   degradation.
 - **Driftwood** — `--bin driftwood` — dual-engine (TIME + SPACE + MOVEMENT)
-  Mood-style ambient machine; design in
-  [`docs/driftwood-plan.md`](docs/driftwood-plan.md), glossary in
-  [`src/driftwood/CONTEXT.md`](src/driftwood/CONTEXT.md), decisions in
+  Mood-style ambient machine. **Agents: read
+  [`docs/driftwood-agent-guide.md`](docs/driftwood-agent-guide.md) first**
+  (iron rules, test map, bench ops), then take tasks from
+  [`docs/driftwood-next-work.md`](docs/driftwood-next-work.md). Original
+  design: [`docs/driftwood-plan.md`](docs/driftwood-plan.md); glossary:
+  [`src/driftwood/CONTEXT.md`](src/driftwood/CONTEXT.md); decisions:
   [`docs/adr/`](docs/adr/).
 
 ## ⚠️ Confirm your Daisy Seed revision first

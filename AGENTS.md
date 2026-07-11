@@ -108,3 +108,19 @@ the shimmer loop is the most expensive element.
   split into interval selection when shimmer toggle is active.
 - Expression pedal input on HotHouse maps well to MORPH for real-time
   foot-controlled morphing.
+
+## Rust firmware (Driftwood, Cassette) — read this first
+
+The `rust/` workspace hosts the Rust pedals (branch `driftwood`). Before
+touching ANY Rust DSP or firmware code, read, in order:
+
+1. `rust/docs/driftwood-agent-guide.md` — the iron rules of the signal path.
+   Each rule was paid for with a real bench failure and most are enforced by a
+   host regression test (`cargo test -p dsp`). Violating one is a regression,
+   not a refactor.
+2. `rust/docs/driftwood-next-work.md` — the scoped work queue with acceptance
+   criteria, sized for single sessions.
+
+Hardware facts that override anything else: the bench Daisy Seed is a rev 1.2
+(`seed_1_2` codec feature, the default — wrong codec = silence/motorboating);
+the chain input sums L+R; DFU = both footswitches + KNOB_5 fully CCW ~1.5 s.
