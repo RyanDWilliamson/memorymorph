@@ -27,7 +27,7 @@ const MAX_DELAY_S: f32 = 0.90;
 /// BBD soft clip rather than running away to infinity. Keep the excess small:
 /// the further past unity, the harder every pass works the clipper and the
 /// buzzier the frozen loop gets (bench: "digital artifacts").
-const HAVOC_FB: f32 = 1.008;
+const HAVOC_FB: f32 = 1.002;
 /// Max varispeed glide rate, in delay-samples per sample. Keeping this < 1
 /// keeps the read head's forward velocity positive (1 ± rate), so a glide can
 /// NEVER re-read a buffer region: re-reads duplicate energy into the feedback
@@ -59,9 +59,14 @@ pub struct TimeEngine {
     feedback: f32,
     fb_target: f32,
 
+    // Knob targets (block rate) and their per-sample smoothed values —
+    // spinning any knob must never step the audio (zipper pops).
     drive: f32,
     mix: f32,
     level: f32,
+    drive_s: f32,
+    mix_s: f32,
+    level_s: f32,
 
     slip_phase: f32,
     /// Precomputed `SLIP_DRIFT_HZ / fs` (hoists a per-sample divide).
@@ -81,9 +86,9 @@ pub struct TimeEngine {
 impl TimeEngine {
     pub fn new(fs: f32, buf: &'static mut [f32]) -> Self {
         let mut warble = Warble::new(fs);
-        // Tape-slow: 0.4 Hz wow, 3.5 Hz flutter (bench: 0.8/8.0 read as
-        // "way too fast" — flutter dominated).
-        warble.set_rates(0.4, 3.5, fs);
+        // Seasick, not fluttery (bench-tuned twice): slow queasy wow with only
+        // a hint of flutter.
+        warble.set_rates(0.25, 1.8, fs);
         Self {
             fs,
             delay: DelayLine::new(buf),
@@ -99,6 +104,9 @@ impl TimeEngine {
             drive: 0.3,
             mix: 0.4,
             level: 0.8,
+            drive_s: 0.3,
+            mix_s: 0.4,
+            level_s: 0.8,
             slip_phase: 0.0,
             slip_inc: SLIP_DRIFT_HZ / fs,
             last_time_in: (f32::NAN, f32::NAN), // force first computation
@@ -189,10 +197,14 @@ impl TimeEngine {
     /// movement is off or targeting something else.
     #[inline]
     pub fn process(&mut self, x: f32, vib: f32) -> f32 {
-        // Rate-limited varispeed glide (see MAX_GLIDE) + feedback smoothing.
+        // Rate-limited varispeed glide (see MAX_GLIDE) + control smoothing
+        // (~10 ms): every knob must be spinnable without zipper pops.
         let step = (self.target_delay - self.cur_delay).clamp(-MAX_GLIDE, MAX_GLIDE);
         self.cur_delay += step;
         self.feedback += 0.002 * (self.fb_target - self.feedback);
+        self.drive_s += 0.001 * (self.drive - self.drive_s);
+        self.mix_s += 0.001 * (self.mix - self.mix_s);
+        self.level_s += 0.001 * (self.level - self.level_s);
 
         match self.mode {
             TimeMode::Looper => self.process_looper(x),
@@ -226,14 +238,14 @@ impl TimeEngine {
 
         let fb = self.feedback + (HAVOC_FB - self.feedback) * self.freeze_amt;
         let input = x * (1.0 - self.freeze_amt);
-        let drive_gain = 1.0 + 3.0 * self.drive;
+        let drive_gain = 1.0 + 3.0 * self.drive_s;
         // Recirculate in the compressed domain (read_raw, exactly as stored):
         // expanding + re-compressing the loop gives the compander a non-zero
         // fixed point — repeats that never decay (bench "eternal loop" bug).
         let write_in = self.bbd.pre_mix(input * drive_gain, read_raw * fb);
         self.delay.write(write_in);
 
-        (x * (1.0 - self.mix) + wet * self.mix) * self.level
+        (x * (1.0 - self.mix_s) + wet * self.mix_s) * self.level_s
     }
 
     #[inline]
@@ -246,7 +258,7 @@ impl TimeEngine {
                 self.delay.poke(self.rec_pos, x);
                 self.rec_pos += 1;
             }
-            return x * self.level;
+            return x * self.level_s;
         }
 
         let play = self.delay.peek(self.loop_pos);
@@ -259,7 +271,7 @@ impl TimeEngine {
             self.loop_pos = 0;
         }
 
-        (x * (1.0 - self.mix) + play * self.mix) * self.level
+        (x * (1.0 - self.mix_s) + play * self.mix_s) * self.level_s
     }
 
     fn close_loop(&mut self) {
