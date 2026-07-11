@@ -16,7 +16,6 @@ use dsp::bbd::Bbd;
 use dsp::fastmath;
 use dsp::looper::{Looper, LooperAction, LooperInput};
 use dsp::warble::Warble;
-use dsp::one_pole_coeff;
 use libm::powf;
 
 use super::params::{Params, TimeMode};
@@ -27,6 +26,13 @@ const MAX_DELAY_S: f32 = 0.90;
 /// Freeze/havoc feedback — just past unity so it blooms, held in check by the
 /// BBD soft clip rather than running away to infinity.
 const HAVOC_FB: f32 = 1.015;
+/// Max varispeed glide rate, in delay-samples per sample. Keeping this < 1
+/// keeps the read head's forward velocity positive (1 ± rate), so a glide can
+/// NEVER re-read a buffer region: re-reads duplicate energy into the feedback
+/// loop (effective gain k·fb > 1 → runaway on any big time-knob sweep —
+/// bench-confirmed). 0.5 ≈ ±1 octave of pitch bend while chasing, and a
+/// full-range sweep glides over ~1.7 s like a real tape transport.
+const MAX_GLIDE: f32 = 0.5;
 const SLIP_DRIFT_HZ: f32 = 0.13;
 /// Overdub layer decay, so stacked passes don't build up without bound.
 const OVERDUB_DECAY: f32 = 0.96;
@@ -40,10 +46,9 @@ pub struct TimeEngine {
     mode: TimeMode,
     freeze: bool,
 
-    // Varispeed: slewed fractional delay length (samples).
+    // Varispeed: rate-limited fractional delay length (samples).
     target_delay: f32,
     cur_delay: f32,
-    delay_slew: f32,
 
     // Smoothed feedback.
     feedback: f32,
@@ -81,7 +86,6 @@ impl TimeEngine {
             freeze: false,
             target_delay: 0.3 * fs,
             cur_delay: 0.3 * fs,
-            delay_slew: one_pole_coeff(5.0, fs),
             feedback: 0.3,
             fb_target: 0.3,
             drive: 0.3,
@@ -174,8 +178,9 @@ impl TimeEngine {
     /// movement is off or targeting something else.
     #[inline]
     pub fn process(&mut self, x: f32, vib: f32) -> f32 {
-        // Varispeed glide + feedback smoothing.
-        self.cur_delay += self.delay_slew * (self.target_delay - self.cur_delay);
+        // Rate-limited varispeed glide (see MAX_GLIDE) + feedback smoothing.
+        let step = (self.target_delay - self.cur_delay).clamp(-MAX_GLIDE, MAX_GLIDE);
+        self.cur_delay += step;
         self.feedback += 0.002 * (self.fb_target - self.feedback);
 
         match self.mode {
