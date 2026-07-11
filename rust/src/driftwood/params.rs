@@ -90,7 +90,9 @@ impl Params {
         // TIME:   time  repeats warble drive  mix   level
         [0.30, 0.30, 0.20, 0.30, 0.40, 0.80],
         // MASTER: rate  depth   shape  inGain target outLvl
-        [0.30, 0.30, 0.00, 0.50, 0.00, 0.80],
+        // depth defaults to 0: a hidden page must not ship an active
+        // modulator (0.3 tremolo read as mystery pulsing on the bench).
+        [0.30, 0.00, 0.00, 0.50, 0.00, 0.80],
         // SPACE:  decay regen   mod    age    mix    tone
         [0.40, 0.30, 0.20, 0.20, 0.30, 0.60],
     ];

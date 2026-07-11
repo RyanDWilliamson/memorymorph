@@ -25,8 +25,10 @@ use super::params::{Params, SpaceMode};
 /// Internal comb feedback during bloom (FS1-hold): just past unity, bounded by
 /// the clip inside the comb feedback path.
 const BLOOM_FB: f32 = 1.01;
-/// Comb feedback ceiling reachable with the regen knob (strictly stable).
-const REGEN_FB_MAX: f32 = 0.995;
+/// Comb feedback ceiling reachable with the regen knob. 0.98 ≈ a ~10 s wash:
+/// long, but audibly ebbing — 0.995 (~40 s) integrated everything played for
+/// so long it read as runaway feedback on the bench.
+const REGEN_FB_MAX: f32 = 0.98;
 
 pub struct SpaceEngine {
     reverb: Pt2399Reverb,
@@ -66,7 +68,7 @@ impl SpaceEngine {
 
         // Regeneration = internal comb feedback. K1 (decay) sets the base tail;
         // K2 (regen) closes the remaining gap toward REGEN_FB_MAX, never past.
-        let base = 0.70 + 0.29 * p.space_decay();
+        let base = 0.70 + 0.25 * p.space_decay(); // max 0.95 ≈ 4 s tail
         let fb = if bloom {
             BLOOM_FB
         } else {
