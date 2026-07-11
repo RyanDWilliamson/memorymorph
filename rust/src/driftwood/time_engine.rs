@@ -153,7 +153,8 @@ impl TimeEngine {
         self.level = p.time_level() * 1.4;
 
         self.warble.set_amount(p.time_warble());
-        self.bbd.set_noise(0.0005 + self.drive * 0.003);
+        // Halved from the first pass — the hiss floor was part of the "fuzz".
+        self.bbd.set_noise(0.0003 + self.drive * 0.0015);
 
         // BBD bandwidth tracks the (slewing) delay and feedback, but the expf
         // pair inside set_time only reruns for a >1 % change.

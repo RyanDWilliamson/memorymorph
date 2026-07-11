@@ -28,7 +28,7 @@
 //!
 //! Pure `libm` math; host-tested under `cargo test`.
 
-use crate::fastmath::{self, soft_clip};
+use crate::fastmath;
 use crate::onepole::OnePole;
 
 /// Effective BBD stage count — sets how the clock (and therefore bandwidth)
@@ -58,9 +58,10 @@ pub struct Bbd {
 
 impl Bbd {
     pub fn new(fs: f32) -> Self {
-        // ~8 ms syllabic time constant: slow enough to pump musically, fast
-        // enough to follow notes.
-        let env_coeff = crate::onepole::one_pole_coeff(20.0, fs);
+        // Syllabic time constant ~20 ms (8 Hz): fast envelopes ripple at
+        // audio rate on low notes and the ripple modulates the compander gain
+        // into intermodulation fuzz (bench: "digital fuzzy").
+        let env_coeff = crate::onepole::one_pole_coeff(8.0, fs);
         let mut b = Self {
             fs,
             pre_lp: OnePole::new(8_000.0, fs),
@@ -122,13 +123,14 @@ impl Bbd {
     pub fn pre_mix(&mut self, x: f32, feedback_compressed: f32) -> f32 {
         self.comp_env += self.env_coeff * (x.abs() - self.comp_env);
         let gain = fastmath::sqrt(REF / (self.comp_env + ENV_EPS)).clamp(0.5, 6.0);
-        // Gain staging: cap the dry injection so hot playing squashes
-        // (tape-like) instead of railing the loop's clip headroom — otherwise
-        // the buffer parks at the clip and the repeats tower over the dry
-        // ("feedback" while playing hot). The recirculation keeps its own
-        // headroom above the cap.
-        let driven = (x * gain).clamp(-0.6, 0.6);
-        let compressed = soft_clip(driven + feedback_compressed);
+        // Gain staging: knee-limit the dry injection so hot playing squashes
+        // smoothly (a hard clamp here flat-tops = digital fuzz) while the
+        // recirculation keeps headroom above it. The loop clip is also a knee:
+        // linear region for normal repeats (a clip with no linear region
+        // distorts every pass and the loop accumulates it into fuzz), smooth
+        // saturation only near the rail / during freeze bloom.
+        let driven = fastmath::knee_clip(x * gain, 0.45);
+        let compressed = fastmath::knee_clip(driven + feedback_compressed, 0.75);
         self.pre_lp.process(compressed)
     }
 

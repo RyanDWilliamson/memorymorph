@@ -48,6 +48,25 @@ pub fn soft_clip(x: f32) -> f32 {
     x - (x * x * x) * (1.0 / 6.75)
 }
 
+/// Knee clip: exactly linear for |x| ≤ knee, smooth quadratic saturation
+/// above, hard-bounded at knee + 0.6. Monotonic. Use inside feedback loops:
+/// a clip with no linear region (like [`soft_clip`]) distorts every level on
+/// every pass and the recirculation accumulates it into fuzz.
+#[inline]
+pub fn knee_clip(x: f32, knee: f32) -> f32 {
+    let a = x.abs();
+    if a <= knee {
+        return x;
+    }
+    let over = (a - knee).min(1.0);
+    let sat = knee + over * (1.0 - 0.4 * over);
+    if x < 0.0 {
+        -sat
+    } else {
+        sat
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,6 +95,26 @@ mod tests {
         }
         assert_eq!(sqrt(0.0), 0.0);
         assert_eq!(sqrt(-1.0), 0.0);
+    }
+
+    #[test]
+    fn knee_clip_is_linear_then_bounded_and_monotonic() {
+        // Exactly linear inside the knee.
+        for i in -75..=75 {
+            let x = i as f32 * 0.01;
+            assert_eq!(knee_clip(x, 0.75), x);
+        }
+        // Monotonic and bounded above it.
+        let mut prev = knee_clip(0.75, 0.75);
+        for i in 76..400 {
+            let x = i as f32 * 0.01;
+            let y = knee_clip(x, 0.75);
+            assert!(y >= prev, "monotonicity broken at {x}");
+            assert!(y <= 0.75 + 0.6 + 1e-6, "bound broken at {x}: {y}");
+            prev = y;
+        }
+        assert_eq!(knee_clip(-0.5, 0.75), -0.5);
+        assert!(knee_clip(-3.0, 0.75) >= -(0.75 + 0.6));
     }
 
     #[test]
