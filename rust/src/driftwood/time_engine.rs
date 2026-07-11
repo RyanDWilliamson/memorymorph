@@ -24,8 +24,10 @@ use crate::delay::DelayLine;
 const MIN_DELAY_S: f32 = 0.05;
 const MAX_DELAY_S: f32 = 0.90;
 /// Freeze/havoc feedback — just past unity so it blooms, held in check by the
-/// BBD soft clip rather than running away to infinity.
-const HAVOC_FB: f32 = 1.015;
+/// BBD soft clip rather than running away to infinity. Keep the excess small:
+/// the further past unity, the harder every pass works the clipper and the
+/// buzzier the frozen loop gets (bench: "digital artifacts").
+const HAVOC_FB: f32 = 1.008;
 /// Max varispeed glide rate, in delay-samples per sample. Keeping this < 1
 /// keeps the read head's forward velocity positive (1 ± rate), so a glide can
 /// NEVER re-read a buffer region: re-reads duplicate energy into the feedback
@@ -45,6 +47,9 @@ pub struct TimeEngine {
 
     mode: TimeMode,
     freeze: bool,
+    /// Smoothed 0..1 freeze engagement (~5 ms), so entering/leaving freeze is
+    /// click-free instead of a hard input-mute + feedback step.
+    freeze_amt: f32,
 
     // Varispeed: rate-limited fractional delay length (samples).
     target_delay: f32,
@@ -76,7 +81,9 @@ pub struct TimeEngine {
 impl TimeEngine {
     pub fn new(fs: f32, buf: &'static mut [f32]) -> Self {
         let mut warble = Warble::new(fs);
-        warble.set_rates(0.8, 8.0, fs);
+        // Tape-slow: 0.4 Hz wow, 3.5 Hz flutter (bench: 0.8/8.0 read as
+        // "way too fast" — flutter dominated).
+        warble.set_rates(0.4, 3.5, fs);
         Self {
             fs,
             delay: DelayLine::new(buf),
@@ -84,6 +91,7 @@ impl TimeEngine {
             warble,
             mode: TimeMode::Delay,
             freeze: false,
+            freeze_amt: 0.0,
             target_delay: 0.3 * fs,
             cur_delay: 0.3 * fs,
             feedback: 0.3,
@@ -140,7 +148,9 @@ impl TimeEngine {
 
         self.drive = p.time_drive();
         self.mix = p.time_mix();
-        self.level = p.time_level();
+        // Headroom above unity (unity ≈ 71% rotation) — engaged must be able
+        // to match bypass loudness.
+        self.level = p.time_level() * 1.4;
 
         self.warble.set_amount(p.time_warble());
         self.bbd.set_noise(0.0005 + self.drive * 0.003);
@@ -205,11 +215,12 @@ impl TimeEngine {
         let read_raw = self.delay.read(read_samples);
         let wet = self.bbd.post(read_raw);
 
-        let (fb, input) = if self.freeze {
-            (HAVOC_FB, 0.0)
-        } else {
-            (self.feedback, x)
-        };
+        // Smoothed freeze engagement: fade the input out and the feedback up
+        // over ~5 ms instead of hard-switching (click-free entry/exit).
+        let ft = if self.freeze { 1.0 } else { 0.0 };
+        self.freeze_amt += 0.002 * (ft - self.freeze_amt);
+        let fb = self.feedback + (HAVOC_FB - self.feedback) * self.freeze_amt;
+        let input = x * (1.0 - self.freeze_amt);
         let drive_gain = 1.0 + 3.0 * self.drive;
         // Recirculate in the compressed domain (read_raw, exactly as stored):
         // expanding + re-compressing the loop gives the compander a non-zero

@@ -38,8 +38,8 @@ impl DriftwoodEngine {
             time: TimeEngine::new(fs, time_buf),
             space: SpaceEngine::new(fs, reverb_buf, shimmer_buf),
             movement: MovementEngine::new(fs),
-            g_in: 0.35 + 0.9 * Params::DEFAULT_KNOBS[1][3],
-            g_out: Params::DEFAULT_KNOBS[1][5],
+            g_in: 0.4 + 1.2 * Params::DEFAULT_KNOBS[1][3],
+            g_out: 1.25 * Params::DEFAULT_KNOBS[1][5],
         }
     }
 
@@ -47,10 +47,11 @@ impl DriftwoodEngine {
         self.time.set_params(p);
         self.space.set_params(p); // reads p.freeze itself: FS1-hold blooms
         self.movement.set_params(p);
-        // 0.35..1.25 operating point: enough trim for quiet/hot pickups without
-        // slamming the modeled stages into their rails (gain-staging plan).
-        self.g_in = 0.35 + 0.9 * p.input_gain();
-        self.g_out = p.output_level();
+        // Unity at the knob defaults (bench: engaged was audibly quieter than
+        // bypass). Input 0.4..1.6 with unity at center; output unity at its
+        // 0.8 default, small boost above.
+        self.g_in = 0.4 + 1.2 * p.input_gain();
+        self.g_out = 1.25 * p.output_level();
     }
 
     /// Forward a looper transport event to the TIME engine (LOOPER mode).
