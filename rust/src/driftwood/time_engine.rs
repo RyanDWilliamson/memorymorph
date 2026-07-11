@@ -201,6 +201,13 @@ impl TimeEngine {
 
     #[inline]
     fn process_delay(&mut self, x: f32, vib: f32) -> f32 {
+        // Smoothed freeze engagement (~20 ms): fades the input out, the
+        // feedback up, and the modulation away — a frozen tape doesn't wobble,
+        // and wobbling the frozen loop re-interpolates the same audio hundreds
+        // of times (progressive resampling grit, bench "digital sounds").
+        let ft = if self.freeze { 1.0 } else { 0.0 };
+        self.freeze_amt += 0.0005 * (ft - self.freeze_amt);
+
         let w = self.warble.process(); // [-1,1] × amount
         let mut mod_frac = w * 0.02 + vib; // ±2% wow/flutter + movement vibrato
         if self.mode == TimeMode::TapeSlip {
@@ -210,15 +217,12 @@ impl TimeEngine {
             }
             mod_frac += 0.03 * fastmath::sin_01(self.slip_phase); // slow wander
         }
+        mod_frac *= 1.0 - self.freeze_amt;
 
         let read_samples = self.cur_delay * (1.0 + mod_frac);
         let read_raw = self.delay.read(read_samples);
         let wet = self.bbd.post(read_raw);
 
-        // Smoothed freeze engagement: fade the input out and the feedback up
-        // over ~5 ms instead of hard-switching (click-free entry/exit).
-        let ft = if self.freeze { 1.0 } else { 0.0 };
-        self.freeze_amt += 0.002 * (ft - self.freeze_amt);
         let fb = self.feedback + (HAVOC_FB - self.feedback) * self.freeze_amt;
         let input = x * (1.0 - self.freeze_amt);
         let drive_gain = 1.0 + 3.0 * self.drive;

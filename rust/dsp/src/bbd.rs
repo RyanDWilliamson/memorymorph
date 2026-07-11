@@ -32,9 +32,9 @@ use crate::fastmath::{self, soft_clip};
 use crate::onepole::OnePole;
 
 /// Effective BBD stage count — sets how the clock (and therefore bandwidth)
-/// scales with delay time. ~4096 gives a musically dark long delay and a bright
-/// short one.
-const STAGES: f32 = 4096.0;
+/// scales with delay time. ~6144 ≈ 1.5 ganged MN3005s: long delays stay dark
+/// but articulate (4096 read as "smeared" at 300 ms on the bench).
+const STAGES: f32 = 6144.0;
 
 /// Compander reference level (linear). Signals near this pass at unity; quieter
 /// signals are boosted (and their noise floor with them).
@@ -85,7 +85,10 @@ impl Bbd {
         cutoff *= 1.0 - 0.4 * feedback.clamp(0.0, 1.0); // regen collapse
         let cutoff = cutoff.clamp(1_200.0, (0.45 * self.fs).min(10_000.0));
         self.bandwidth = cutoff;
-        self.pre_lp.set_cutoff(cutoff, self.fs);
+        // Anti-alias (pre) sits above reconstruction (post), as in real BBD
+        // designs — stacking both at the same cutoff doubled the slope and
+        // smeared the repeats.
+        self.pre_lp.set_cutoff((1.4 * cutoff).min(10_000.0), self.fs);
         self.post_lp.set_cutoff(cutoff, self.fs);
     }
 
@@ -135,7 +138,9 @@ impl Bbd {
         let filtered = self.post_lp.process(x);
         let noisy = filtered + self.white() * self.noise_amt;
         self.exp_env += self.env_coeff * (noisy.abs() - self.exp_env);
-        let gain = fastmath::sqrt((self.exp_env + ENV_EPS) / REF).clamp(0.1, 2.0);
+        // Ceiling 1.6 (was 2.0): a hot frozen loop expanded ×2 flat-topped the
+        // output limiter — audible pops right after freeze engaged.
+        let gain = fastmath::sqrt((self.exp_env + ENV_EPS) / REF).clamp(0.1, 1.6);
         noisy * gain
     }
 
