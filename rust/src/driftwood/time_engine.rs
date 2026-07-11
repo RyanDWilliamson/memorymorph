@@ -197,9 +197,14 @@ impl TimeEngine {
     /// movement is off or targeting something else.
     #[inline]
     pub fn process(&mut self, x: f32, vib: f32) -> f32 {
-        // Rate-limited varispeed glide (see MAX_GLIDE) + control smoothing
-        // (~10 ms): every knob must be spinnable without zipper pops.
-        let step = (self.target_delay - self.cur_delay).clamp(-MAX_GLIDE, MAX_GLIDE);
+        // Varispeed glide: proportional chase capped by MAX_GLIDE. Pure rate
+        // limiting was bang-bang — every quantized knob step fired a burst at
+        // exactly ±MAX_GLIDE then hard-stopped, a train of pitch square-pulses
+        // (audible chirps while turning the time knob). Proportional keeps
+        // small motions as gentle exponential glides; big sweeps still ride
+        // the cap (tape chase), and the anti-runaway invariant |step| < 1
+        // sample/sample is preserved.
+        let step = (0.0005 * (self.target_delay - self.cur_delay)).clamp(-MAX_GLIDE, MAX_GLIDE);
         self.cur_delay += step;
         self.feedback += 0.002 * (self.fb_target - self.feedback);
         self.drive_s += 0.001 * (self.drive - self.drive_s);
