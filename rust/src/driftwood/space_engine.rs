@@ -93,7 +93,7 @@ impl SpaceEngine {
         // regen range (host regression test covers the worst case). At bloom
         // (fb > 1) the headroom is zero — bloom is pure tank self-oscillation.
         self.shimmer_amt = if shimmer_on {
-            ((0.3 + 0.7 * p.space_regen()) * (1.0 - fb)).clamp(0.0, 0.15)
+            ((0.3 + 0.7 * p.space_regen()) * 0.5 * (1.0 - fb)).clamp(0.0, 0.08)
         } else {
             0.0
         };

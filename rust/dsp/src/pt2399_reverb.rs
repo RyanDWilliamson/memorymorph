@@ -399,7 +399,7 @@ mod tests {
         // Regression for the bench "massive feedback": the tank amplifies any
         // injection by its resonant gain ~1/(1-fb), so the SpaceEngine scales
         // the shimmer budget with the remaining headroom:
-        //   amt = (0.3 + 0.7·regen) · 2 · (1 - fb), clamped to 0.3
+        //   amt = (0.3 + 0.7·regen) · 0.5 · (1 - fb), clamped to 0.08
         // Verify the whole law stays bounded and decaying at the least-damped
         // tone, sweeping fb across the regen range (worst case is mid fb where
         // the budget is largest).
@@ -409,25 +409,40 @@ mod tests {
             r.set_feedback(fb);
             r.set_tone(1.0); // least damping = worst case
             r.set_mod(0.5);
-            let amt = (1.0 * (1.0 - fb)).clamp(0.0, 0.15); // regen knob = 1.0
+            let amt = (0.5 * (1.0 - fb)).clamp(0.0, 0.08); // regen knob = 1.0
             let shim_buf: &'static mut [f32] =
                 Box::leak(vec![0.0f32; 2048].into_boxed_slice());
             let mut shim = OctaveUp::new(shim_buf);
             let mut tail = 0.0f32;
+            let mut early_peak = 0.0f32;
             let mut late_peak = 0.0f32;
             for n in 0..(FS as usize * 3) {
                 let x = if n < 4800 { 0.5 } else { 0.0 }; // 50 ms burst
                 let inject = shim.process(tail) * amt;
                 tail = r.process(x, inject);
                 assert!(tail.is_finite(), "non-finite tail at fb={fb} n={n}");
+                let t0 = (0.3 * FS) as usize;
+                let t1 = (0.5 * FS) as usize;
+                if (t0..t1).contains(&n) {
+                    early_peak = early_peak.max(tail.abs());
+                }
                 if n > FS as usize * 2 {
                     late_peak = late_peak.max(tail.abs());
                 }
             }
+            // Never growing — the loop must not regenerate above its own tail.
             assert!(
-                late_peak < 0.5,
-                "tail must decay, fb={fb} late peak {late_peak}"
+                late_peak <= early_peak * 1.05,
+                "tail must not grow, fb={fb}: early {early_peak} late {late_peak}"
             );
+            // Below the near-infinite top (fb=0.995 is a ~40 s wash by design),
+            // the tail must audibly decay within the window.
+            if fb <= 0.95 {
+                assert!(
+                    late_peak < 0.35 * early_peak,
+                    "tail must decay, fb={fb}: early {early_peak} late {late_peak}"
+                );
+            }
         }
     }
 
