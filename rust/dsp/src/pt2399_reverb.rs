@@ -144,6 +144,18 @@ impl Pt2399Reverb {
         self.drive = a;
     }
 
+    /// Output normalization for a given comb feedback: a comb bank's gain at
+    /// its mode frequencies is ~1/(1-fb) — broadband unity, but huge peaks at
+    /// specific pitches that turn the pedal into a frequency-selective
+    /// amplifier inside any room/rig loop (bench: runaway howl at one pitch,
+    /// gated by guitar volume). Scaling the output by (1-fb) holds the peak
+    /// gain roughly constant across the regen range: more regen = LONGER
+    /// tails, never LOUDER ones. Engine and tests share this law.
+    #[inline]
+    pub fn output_norm_for(fb: f32) -> f32 {
+        (4.0 * (1.0 - fb.min(0.995))).clamp(0.08, 1.0)
+    }
+
     /// Modulation amount (0..1) → comb-tap detune depth.
     pub fn set_mod(&mut self, amount: f32) {
         self.mod_depth = MOD_DEPTH_MAX * amount.clamp(0.0, 1.0);
@@ -443,6 +455,38 @@ mod tests {
                     "tail must decay, fb={fb}: early {early_peak} late {late_peak}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn resonant_peak_gain_is_bounded_across_regen() {
+        // Drive a sine at an exact comb-mode frequency (worst case) and assert
+        // the normalized steady-state gain stays bounded — the pedal must not
+        // be a frequency-selective amplifier at any regen setting.
+        let scale = FS / REF_FS;
+        let len = ((COMB_TUNING[0] as f32) * scale) as usize; // first comb
+        let mode_hz = 5.0 * FS / len as f32; // 5th mode, ~200 Hz
+        for &fb in &[0.85f32, 0.90, 0.95] {
+            let mut r = mk();
+            r.set_feedback(fb);
+            r.set_tone(1.0);
+            r.set_mod(0.0); // unmodulated = sharpest resonance
+            let norm = Pt2399Reverb::output_norm_for(fb);
+            let mut pin = 0.0f32;
+            let mut pout = 0.0f32;
+            for n in 0..(FS as usize * 2) {
+                let x = 0.1 * libm::sinf(core::f32::consts::TAU * mode_hz * n as f32 / FS);
+                let y = r.process(x, 0.0) * norm;
+                if n > FS as usize {
+                    pin = pin.max(x.abs());
+                    pout = pout.max(y.abs());
+                }
+            }
+            let g = pout / pin;
+            assert!(
+                g < 1.6,
+                "normalized resonant gain must stay bounded: fb={fb} gain={g}"
+            );
         }
     }
 

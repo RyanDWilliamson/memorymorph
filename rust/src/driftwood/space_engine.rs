@@ -28,7 +28,7 @@ const BLOOM_FB: f32 = 1.01;
 /// Comb feedback ceiling reachable with the regen knob. 0.98 ≈ a ~10 s wash:
 /// long, but audibly ebbing — 0.995 (~40 s) integrated everything played for
 /// so long it read as runaway feedback on the bench.
-const REGEN_FB_MAX: f32 = 0.98;
+const REGEN_FB_MAX: f32 = 0.95;
 
 pub struct SpaceEngine {
     reverb: Pt2399Reverb,
@@ -36,6 +36,7 @@ pub struct SpaceEngine {
     /// Mix target (knob) and its per-sample smoothed value (zipper-free K5).
     mix: f32,
     mix_s: f32,
+    out_norm: f32,
     shimmer_amt: f32,
     last_tail: f32,
 }
@@ -52,6 +53,7 @@ impl SpaceEngine {
             shimmer: OctaveUp::new(shimmer_buf),
             mix: 0.3,
             mix_s: 0.3,
+            out_norm: 1.0,
             shimmer_amt: 0.0,
             last_tail: 0.0,
         }
@@ -75,6 +77,9 @@ impl SpaceEngine {
             base + p.space_regen() * (REGEN_FB_MAX - base)
         };
         self.reverb.set_feedback(fb);
+        // Constant resonant-peak gain across the regen range (see
+        // Pt2399Reverb::output_norm_for): more regen = longer, never louder.
+        self.out_norm = Pt2399Reverb::output_norm_for(fb);
 
         // Character toggle shapes tone/modulation and enables shimmer.
         let (tone_scale, mod_scale, shimmer_on) = match mode {
@@ -119,7 +124,7 @@ impl SpaceEngine {
         // There is no recirculation here — regeneration lives inside the
         // reverb's comb feedback (see module docs).
         let send = knee_clip(x * send_gain, 0.75);
-        let wet = self.reverb.process(send, inject);
+        let wet = self.reverb.process(send, inject) * self.out_norm;
         self.last_tail = wet;
         self.mix_s += 0.001 * (self.mix - self.mix_s); // zipper-free mix knob
         x * (1.0 - self.mix_s) + wet * self.mix_s
