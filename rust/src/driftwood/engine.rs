@@ -68,10 +68,19 @@ impl DriftwoodEngine {
         self.movement.reset();
     }
 
+    /// Bench focus: TIME engine only — SPACE and MOVEMENT are out of the
+    /// signal path while the delay is verified/voiced in isolation. Flip to
+    /// false to restore the full chain.
+    const TIME_ONLY: bool = true;
+
     #[inline]
     pub fn process(&mut self, x: f32, p: &Params) -> f32 {
         if p.bypass {
             return x; // unity dry pass-through
+        }
+        if Self::TIME_ONLY {
+            let t = self.time.process(x * self.g_in, 0.0);
+            return soft_limit(t * self.g_out);
         }
         self.movement.tick();
         let t = self.time.process(x * self.g_in, self.movement.vib());
