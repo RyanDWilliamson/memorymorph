@@ -219,7 +219,7 @@ impl TimeEngine {
         // and wobbling the frozen loop re-interpolates the same audio hundreds
         // of times (progressive resampling grit, bench "digital sounds").
         let ft = if self.freeze { 1.0 } else { 0.0 };
-        self.freeze_amt += 0.0005 * (ft - self.freeze_amt);
+        self.freeze_amt += 0.0001 * (ft - self.freeze_amt); // ~100 ms fade
 
         let w = self.warble.process(); // [-1,1] × amount
         let mut mod_frac = w * 0.02 + vib; // ±2% wow/flutter + movement vibrato
