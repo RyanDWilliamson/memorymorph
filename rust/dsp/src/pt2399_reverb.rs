@@ -56,8 +56,10 @@ pub struct Pt2399Reverb {
     mem: &'static mut [f32],
     combs: [Comb; 4],
     allpasses: [Allpass; 2],
-    feedback: f32,  // comb feedback (decay/size)
-    damp: f32,      // comb damping (0=bright .. 1=dark)
+    feedback: f32,   // comb feedback target (decay/size)
+    feedback_s: f32, // per-sample smoothed (knob steps must not transient the loop)
+    damp: f32,       // comb damping target (0=bright .. 1=dark)
+    damp_s: f32,
     band: OnePole,  // PT2399 input/output bandwidth
     quant_levels: f32,
     drive: f32,     // feedback soft-clip drive
@@ -105,7 +107,9 @@ impl Pt2399Reverb {
             combs,
             allpasses,
             feedback: 0.84,
+            feedback_s: 0.84,
             damp: 0.5,
+            damp_s: 0.5,
             band: OnePole::new(4_000.0, fs),
             quant_levels: 2048.0,
             drive: 0.0,
@@ -175,6 +179,10 @@ impl Pt2399Reverb {
     /// accumulating into a scream.
     #[inline]
     pub fn process(&mut self, x: f32, feedback_inject: f32) -> f32 {
+        // ~10 ms smoothing: SPACE knob motion glides instead of stepping the
+        // loop (parameter steps were exciting quantizer limit cycles).
+        self.feedback_s += 0.001 * (self.feedback - self.feedback_s);
+        self.damp_s += 0.001 * (self.damp - self.damp_s);
         let input = self.band.process(x + feedback_inject);
 
         let refresh_mod = self.mod_tick == 0;
@@ -218,7 +226,7 @@ impl Pt2399Reverb {
         // soft_clip: a clip with no linear region distorts every level on
         // every pass and the comb loop accumulates it into fuzz (same lesson
         // as the BBD loop); saturation should engage only near the rail.
-        let filt = out * (1.0 - self.damp) + self.combs[c].filt * self.damp;
+        let filt = out * (1.0 - self.damp_s) + self.combs[c].filt * self.damp_s;
         self.combs[c].filt = filt;
         // Age drives the clipper harder WITH make-up (unity net gain): a bare
         // (1 + drive) multiplier here is loop gain — at default age it pushed
@@ -231,7 +239,7 @@ impl Pt2399Reverb {
         );
 
         let idx = self.combs[c].idx;
-        self.mem[offset + idx] = input + fed * self.feedback;
+        self.mem[offset + idx] = input + fed * self.feedback_s;
         // Compare-wrap instead of `%` — len is not a power of two, so the
         // modulo costs a hardware divide per comb per sample.
         let next = idx + 1;
@@ -306,10 +314,13 @@ fn mk_allpass((offset, len): (usize, usize)) -> Allpass {
     }
 }
 
-/// Coarse amplitude quantisation (PT2399 converter grain).
+/// Coarse amplitude quantisation (PT2399 converter grain). Truncates toward
+/// zero: |quantize(x)| ≤ |x| always, so the quantizer can never hand energy
+/// back to the comb loop — round-to-nearest sustained limit cycles ("birdie"
+/// sine tones at the quantization floor, excited by any knob transient).
 #[inline]
 fn quantize(x: f32, levels: f32) -> f32 {
-    fastmath::round(x * levels) / levels
+    ((x * levels) as i32) as f32 / levels
 }
 
 #[cfg(test)]
@@ -461,6 +472,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn no_quantizer_limit_cycle_birdies() {
+        // Regression: a knob transient must not leave a sustained pure tone at
+        // the quantization floor. Excite hard at max age + high feedback, then
+        // wait: the tank must fall to (near) digital silence.
+        let mut r = mk();
+        r.set_feedback(0.95);
+        r.set_age(1.0); // coarsest quantizer = loudest possible birdie
+        r.set_tone(0.5);
+        r.set_mod(0.0);
+        for n in 0..9600 {
+            let _ = r.process(libm::sinf(0.013 * n as f32), 0.0); // rough excitation
+        }
+        let mut late = 0.0f32;
+        for n in 0..(FS as usize * 6) {
+            let y = r.process(0.0, 0.0).abs();
+            if n > FS as usize * 5 {
+                late = late.max(y);
+            }
+        }
+        assert!(late < 1.0e-3, "sustained birdie at the quantization floor: {late}");
     }
 
     #[test]
