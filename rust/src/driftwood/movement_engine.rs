@@ -25,7 +25,9 @@ pub struct MovementEngine {
     htrem: HarmonicTrem,
     target: MoveTarget,
     shape: Shape,
+    /// Depth target (knob) and per-sample smoothed value (zipper-free K2).
     depth: f32,
+    depth_s: f32,
     cur: f32, // last unipolar LFO value [0,1]
     /// Rate-knob value the LFO rate was last computed for (powf memoization).
     last_rate_knob: f32,
@@ -39,6 +41,7 @@ impl MovementEngine {
             target: MoveTarget::Amplitude,
             shape: Shape::Sine,
             depth: 0.0,
+            depth_s: 0.0,
             cur: 0.5,
             last_rate_knob: f32::NAN, // force first computation
         }
@@ -66,13 +69,14 @@ impl MovementEngine {
     #[inline]
     pub fn tick(&mut self) {
         self.cur = self.lfo.tick();
+        self.depth_s += 0.001 * (self.depth - self.depth_s); // zipper-free depth
     }
 
     /// Vibrato fraction for the TIME delay read (±); 0 unless target == Time.
     #[inline]
     pub fn vib(&self) -> f32 {
         if self.target == MoveTarget::Time {
-            (self.cur * 2.0 - 1.0) * self.depth * VIB_DEPTH
+            (self.cur * 2.0 - 1.0) * self.depth_s * VIB_DEPTH
         } else {
             0.0
         }
@@ -82,7 +86,7 @@ impl MovementEngine {
     #[inline]
     pub fn send_gain(&self) -> f32 {
         if self.target == MoveTarget::Space {
-            1.0 - self.depth + self.depth * self.cur
+            1.0 - self.depth_s + self.depth_s * self.cur
         } else {
             1.0
         }
@@ -91,13 +95,13 @@ impl MovementEngine {
     /// Apply amplitude movement (plain or harmonic tremolo) to the final signal.
     #[inline]
     pub fn apply_amp(&mut self, x: f32) -> f32 {
-        if self.target != MoveTarget::Amplitude || self.depth <= 0.0 {
+        if self.target != MoveTarget::Amplitude || self.depth_s <= 0.0 {
             return x;
         }
         if self.shape == Shape::Harmonic {
-            self.htrem.process(x, self.cur, self.depth)
+            self.htrem.process(x, self.cur, self.depth_s)
         } else {
-            x * (1.0 - self.depth + self.depth * self.cur)
+            x * (1.0 - self.depth_s + self.depth_s * self.cur)
         }
     }
 }

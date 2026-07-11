@@ -69,10 +69,9 @@ impl DriftwoodEngine {
         self.movement.reset();
     }
 
-    /// Bench focus: TIME engine only — SPACE and MOVEMENT are out of the
-    /// signal path while the delay is verified/voiced in isolation. Flip to
-    /// false to restore the full chain.
-    const TIME_ONLY: bool = true;
+    /// Bench focus switch: TIME engine only (SPACE and MOVEMENT out of the
+    /// signal path) — used while the delay was voiced in isolation.
+    const TIME_ONLY: bool = false;
 
     #[inline]
     pub fn process(&mut self, x: f32, p: &Params) -> f32 {

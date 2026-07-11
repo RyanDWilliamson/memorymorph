@@ -20,7 +20,7 @@
 //!
 //! Pure `libm` math; host-tested under `cargo test`.
 
-use crate::fastmath::{self, soft_clip};
+use crate::fastmath;
 use crate::onepole::OnePole;
 
 /// Comb delay tunings (samples @ 44.1 kHz, Freeverb-derived); scaled to `fs`.
@@ -202,10 +202,16 @@ impl Pt2399Reverb {
         let read = self.combs[c].idx as f32 + mod_samp;
         let out = self.read_frac(offset, len, read);
 
-        // Damping low-pass in the feedback, then PT2399 grit.
+        // Damping low-pass in the feedback, then PT2399 grit. Knee clip, not
+        // soft_clip: a clip with no linear region distorts every level on
+        // every pass and the comb loop accumulates it into fuzz (same lesson
+        // as the BBD loop); saturation should engage only near the rail.
         let filt = out * (1.0 - self.damp) + self.combs[c].filt * self.damp;
         self.combs[c].filt = filt;
-        let fed = quantize(soft_clip(filt * (1.0 + self.drive)), self.quant_levels);
+        let fed = quantize(
+            fastmath::knee_clip(filt * (1.0 + self.drive), 0.75),
+            self.quant_levels,
+        );
 
         let idx = self.combs[c].idx;
         self.mem[offset + idx] = input + fed * self.feedback;

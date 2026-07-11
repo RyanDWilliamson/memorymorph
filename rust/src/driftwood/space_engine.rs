@@ -16,7 +16,7 @@
 //! either ran away to inf → NaN-latched silence (unclipped) or a permanent
 //! full-scale scream (clipped). Bench-confirmed both. Don't reintroduce it.
 
-use dsp::fastmath::soft_clip;
+use dsp::fastmath::knee_clip;
 use dsp::pitch::OctaveUp;
 use dsp::pt2399_reverb::Pt2399Reverb;
 
@@ -31,7 +31,9 @@ const REGEN_FB_MAX: f32 = 0.995;
 pub struct SpaceEngine {
     reverb: Pt2399Reverb,
     shimmer: OctaveUp,
+    /// Mix target (knob) and its per-sample smoothed value (zipper-free K5).
     mix: f32,
+    mix_s: f32,
     shimmer_amt: f32,
     last_tail: f32,
 }
@@ -47,6 +49,7 @@ impl SpaceEngine {
             reverb: Pt2399Reverb::new(fs, reverb_buf),
             shimmer: OctaveUp::new(shimmer_buf),
             mix: 0.3,
+            mix_s: 0.3,
             shimmer_amt: 0.0,
             last_tail: 0.0,
         }
@@ -113,9 +116,10 @@ impl SpaceEngine {
         // Soft-clip the send so a hot TIME stage can't slam the comb inputs.
         // There is no recirculation here — regeneration lives inside the
         // reverb's comb feedback (see module docs).
-        let send = soft_clip(x * send_gain);
+        let send = knee_clip(x * send_gain, 0.75);
         let wet = self.reverb.process(send, inject);
         self.last_tail = wet;
-        x * (1.0 - self.mix) + wet * self.mix
+        self.mix_s += 0.001 * (self.mix - self.mix_s); // zipper-free mix knob
+        x * (1.0 - self.mix_s) + wet * self.mix_s
     }
 }
