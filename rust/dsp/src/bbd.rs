@@ -119,7 +119,13 @@ impl Bbd {
     pub fn pre_mix(&mut self, x: f32, feedback_compressed: f32) -> f32 {
         self.comp_env += self.env_coeff * (x.abs() - self.comp_env);
         let gain = fastmath::sqrt(REF / (self.comp_env + ENV_EPS)).clamp(0.5, 6.0);
-        let compressed = soft_clip(x * gain + feedback_compressed);
+        // Gain staging: cap the dry injection so hot playing squashes
+        // (tape-like) instead of railing the loop's clip headroom — otherwise
+        // the buffer parks at the clip and the repeats tower over the dry
+        // ("feedback" while playing hot). The recirculation keeps its own
+        // headroom above the cap.
+        let driven = (x * gain).clamp(-0.6, 0.6);
+        let compressed = soft_clip(driven + feedback_compressed);
         self.pre_lp.process(compressed)
     }
 

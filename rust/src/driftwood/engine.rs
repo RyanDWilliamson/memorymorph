@@ -38,7 +38,7 @@ impl DriftwoodEngine {
             time: TimeEngine::new(fs, time_buf),
             space: SpaceEngine::new(fs, reverb_buf, shimmer_buf),
             movement: MovementEngine::new(fs),
-            g_in: 0.5 + 1.5 * Params::DEFAULT_KNOBS[1][3],
+            g_in: 0.35 + 0.9 * Params::DEFAULT_KNOBS[1][3],
             g_out: Params::DEFAULT_KNOBS[1][5],
         }
     }
@@ -47,7 +47,9 @@ impl DriftwoodEngine {
         self.time.set_params(p);
         self.space.set_params(p); // reads p.freeze itself: FS1-hold blooms
         self.movement.set_params(p);
-        self.g_in = 0.5 + 1.5 * p.input_gain(); // ~0.5..2.0 operating point
+        // 0.35..1.25 operating point: enough trim for quiet/hot pickups without
+        // slamming the modeled stages into their rails (gain-staging plan).
+        self.g_in = 0.35 + 0.9 * p.input_gain();
         self.g_out = p.output_level();
     }
 
