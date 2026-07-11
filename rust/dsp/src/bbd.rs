@@ -93,6 +93,17 @@ impl Bbd {
         self.post_lp.set_cutoff(cutoff, self.fs);
     }
 
+    /// Make-up gain compensating the drive knob's wet-path boost, so drive
+    /// changes *character* (compression, clip, noise) at constant level.
+    /// Calibrated against the measured gain grid (see the unity regression
+    /// test): uncompensated, drive 0→1 boosted the wet path ~1×→~3.3× — a
+    /// booster inside any room/rig loop ⇒ acoustic runaway that commercial
+    /// (unity) pedals don't exhibit. Engine and test share this formula.
+    #[inline]
+    pub fn drive_makeup(drive: f32) -> f32 {
+        1.0 / (1.0 + 2.8 * drive)
+    }
+
     /// Amount of injected hiss (linear, before the expander). Default ~0.0008.
     pub fn set_noise(&mut self, amt: f32) {
         self.noise_amt = amt.max(0.0);
@@ -164,6 +175,39 @@ mod tests {
     fn thru(b: &mut Bbd, x: f32) -> f32 {
         let c = b.pre(x);
         b.post(c)
+    }
+
+
+    #[test]
+    fn wet_path_net_gain_is_unity_across_drive_and_level() {
+        // Regression for the bench "runaway feedback gated by guitar volume":
+        // the drive knob must not change the wet path's net level (character
+        // only). A wet path with gain > 1 makes the pedal a booster inside any
+        // room/rig loop. Grid: drive × input level, all cells near unity.
+        for &drive in &[0.0f32, 0.5, 1.0] {
+            let dg = 1.0 + 3.0 * drive;
+            for &amp in &[0.05f32, 0.2, 0.5] {
+                let mut b = Bbd::new(FS);
+                b.set_noise(0.0);
+                b.set_time(0.3, 0.3);
+                let mut pin = 0.0f32;
+                let mut pout = 0.0f32;
+                for n in 0..48000 {
+                    let x = amp * libm::sinf(core::f32::consts::TAU * 220.0 * n as f32 / FS);
+                    let c = b.pre_mix(x * dg, 0.0);
+                    let y = b.post(c) * Bbd::drive_makeup(drive);
+                    if n > 24000 {
+                        pin = pin.max(x.abs());
+                        pout = pout.max(y.abs());
+                    }
+                }
+                let g = pout / pin;
+                assert!(
+                    (0.55..=1.4).contains(&g),
+                    "wet path must stay ~unity: drive={drive} amp={amp} gain={g}"
+                );
+            }
+        }
     }
 
     #[test]

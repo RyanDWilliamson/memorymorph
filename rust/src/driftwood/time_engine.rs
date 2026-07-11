@@ -239,7 +239,10 @@ impl TimeEngine {
 
         let read_samples = self.cur_delay * (1.0 + mod_frac);
         let read_raw = self.delay.read_cubic(read_samples);
-        let wet = self.bbd.post(read_raw);
+        // Drive make-up: the drive knob shapes character at CONSTANT level
+        // (uncompensated it boosted the wet path up to ~3.3× — a booster
+        // inside any room loop ⇒ the bench's guitar-volume-gated runaway).
+        let wet = self.bbd.post(read_raw) * Bbd::drive_makeup(self.drive_s);
 
         let fb = self.feedback + (HAVOC_FB - self.feedback) * self.freeze_amt;
         let input = x * (1.0 - self.freeze_amt);
