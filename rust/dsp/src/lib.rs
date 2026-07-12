@@ -10,6 +10,7 @@
 
 mod onepole;
 pub mod bbd;
+pub mod delayline;
 pub mod fastmath;
 pub mod lofi;
 pub mod looper;
