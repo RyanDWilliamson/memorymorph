@@ -61,12 +61,42 @@ by TOGGLE_1 with soft-takeover.
 
 - **TOGGLE_2** TIME mode: Looper / Delay / Tape-slip · **TOGGLE_3** SPACE
   character: Dark / Modulated / Shimmer.
-- **FOOTSWITCH_1** is mode-dependent: in delay modes short = tap tempo (and
-  tap-syncs the MOVEMENT LFO), hold = freeze/havoc; in Looper short =
+- **FOOTSWITCH_1** is mode-dependent: in delay modes a press **< 350 ms** =
+  tap tempo (also tap-syncs the MOVEMENT LFO), a hold **≥ 350 ms** = momentary
+  freeze/havoc (the gestures are disjoint); in Looper short =
   record→play→overdub, hold = stop/clear. Moving the time knob releases the tap.
-- **FOOTSWITCH_2** = bypass (trails). DFU = both held + KNOB_5 dry, ~1.5 s.
+- **FOOTSWITCH_2** = bypass, toggles **on press** (trails ring out).
+  DFU = both held + **KNOB_5** fully CCW, ~1.5 s.
 
-On-bench voicing and the CPU-budget check are the remaining Phase-6 items.
+### Behavior notes (as voiced on the bench)
+
+- **Unity positions**: MASTER input (K4) center = 1.0× (range 0.4–1.6);
+  MASTER output (K6) default ≈ unity; TIME level (K6) unity ≈ 71 % rotation
+  (1.4× max). Engaged at these positions matches bypass loudness.
+- **Drive (TIME K4) and Age (SPACE K4) are square-tapered**: subtle through
+  the lower half, fuzz/haze blooms in the top half. Both are
+  character-at-constant-level (make-up compensated — they don't get louder).
+- **Delay time** glides tape-style (pitch bend while chasing, ~1.7 s across
+  the full range); warble is seasick-slow (0.25 Hz wow / 1.8 Hz flutter).
+- **SPACE decay + regen** lengthen the wash (up to ~8 s) at near-constant
+  level; resonant peaks are normalization-bounded so it cannot howl a room.
+- **Freeze** fades in/out over ~100 ms and blooms gently (fb 1.002).
+
+### LED decode (current firmware — includes bench diagnostics)
+
+| Pattern | Meaning |
+|---|---|
+| LED2 solid | Effect engaged (off = bypass) |
+| LED1 solid while playing | Input meter (codec sees signal) — diagnostic |
+| LED1 solid, delay modes, FS1 held | Freeze active |
+| LED1 solid/blink in Looper | Recording–overdubbing / loop playing |
+| LED1 short tick every ½ s | Audio ISR alive, no input — diagnostic |
+| LED1 ~10 Hz flicker | DMA errors occurring (self-healing) — diagnostic |
+| Both LEDs fast strobe, then LED1 blinks 3 digit groups | **Panic** + source line number (LED2 blip = separator, double-blip = zero) |
+| LEDs alternating strobe | HardFault |
+
+(Stripping the diagnostics back to the designed LED roles is Task 1 in
+[`docs/driftwood-next-work.md`](docs/driftwood-next-work.md).)
 
 **Entering DFU without opening the pedal** (mandatory firmware gesture,
 bench-verified 2026-06-27): hold **both footswitches** with the **wet/dry
