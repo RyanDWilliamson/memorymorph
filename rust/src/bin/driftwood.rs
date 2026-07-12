@@ -417,15 +417,55 @@ fn DMA1_STR1() {
 
 // ── Failure-mode reporters (see the diagnostics comment near the top) ────────
 
-/// Rust panic → both LEDs strobe together (~10 Hz).
+/// ~1 ms busy delay units @ 480 MHz (for the fault reporters only).
+fn report_delay_ms(ms: u32) {
+    cortex_m::asm::delay(480_000 * ms);
+}
+
+/// Rust panic → repeating report: a ~1.5 s both-LED strobe ("panic"), then
+/// LED1 blinks the panicking source LINE as three digit groups
+/// (hundreds / tens / units). LED2 blips once between groups; a digit of
+/// zero is a fast LED2 double-blip instead of LED1 blinks. Read the digits,
+/// grep the line.
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
     cortex_m::interrupt::disable();
+    let line = info.location().map(|l| l.line()).unwrap_or(0);
+    let digits = [line / 100 % 10, line / 10 % 10, line % 10];
     loop {
-        unsafe { board::raw_leds(true, true) };
-        cortex_m::asm::delay(24_000_000); // ~50 ms @ 480 MHz
-        unsafe { board::raw_leds(false, false) };
-        cortex_m::asm::delay(24_000_000);
+        // "panic" preamble: fast strobe together.
+        for _ in 0..15 {
+            unsafe { board::raw_leds(true, true) };
+            report_delay_ms(50);
+            unsafe { board::raw_leds(false, false) };
+            report_delay_ms(50);
+        }
+        report_delay_ms(1000);
+        for &d in &digits {
+            if d == 0 {
+                // zero: fast LED2 double-blip.
+                for _ in 0..2 {
+                    unsafe { board::raw_leds(false, true) };
+                    report_delay_ms(80);
+                    unsafe { board::raw_leds(false, false) };
+                    report_delay_ms(80);
+                }
+            } else {
+                for _ in 0..d {
+                    unsafe { board::raw_leds(true, false) };
+                    report_delay_ms(250);
+                    unsafe { board::raw_leds(false, false) };
+                    report_delay_ms(250);
+                }
+            }
+            // group separator: one slow LED2 blip.
+            report_delay_ms(500);
+            unsafe { board::raw_leds(false, true) };
+            report_delay_ms(300);
+            unsafe { board::raw_leds(false, false) };
+            report_delay_ms(700);
+        }
+        report_delay_ms(1500);
     }
 }
 
