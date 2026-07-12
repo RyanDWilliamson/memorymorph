@@ -66,7 +66,10 @@ impl SpaceEngine {
         let bloom = p.freeze;
         let mode = p.space_mode;
         self.mix = p.space_mix();
-        self.reverb.set_age(p.space_age());
+        // Square-law taper (same reasoning as TIME drive): grit blooms
+        // through the top half of the knob instead of arriving all at once.
+        let age = p.space_age();
+        self.reverb.set_age(age * age);
 
         // Regeneration = internal comb feedback. K1 (decay) sets the base tail;
         // K2 (regen) closes the remaining gap toward REGEN_FB_MAX, never past.

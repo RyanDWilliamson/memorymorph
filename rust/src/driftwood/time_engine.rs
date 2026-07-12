@@ -154,7 +154,12 @@ impl TimeEngine {
             _ => 0.95 * p.time_repeats(),
         };
 
-        self.drive = p.time_drive();
+        // Square-law taper: linear drive slammed to max haze by ~10 o'clock
+        // (bench). Squaring keeps the floor and the max, blooms through the
+        // top half of the travel. drive_makeup sees the same tapered value,
+        // so unity holds across the whole curve.
+        let d = p.time_drive();
+        self.drive = d * d;
         self.mix = p.time_mix();
         // Headroom above unity (unity ≈ 71% rotation) — engaged must be able
         // to match bypass loudness.
