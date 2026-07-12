@@ -28,7 +28,7 @@ const BLOOM_FB: f32 = 1.01;
 /// Comb feedback ceiling reachable with the regen knob. 0.98 ≈ a ~10 s wash:
 /// long, but audibly ebbing — 0.995 (~40 s) integrated everything played for
 /// so long it read as runaway feedback on the bench.
-const REGEN_FB_MAX: f32 = 0.95;
+const REGEN_FB_MAX: f32 = 0.97;
 
 pub struct SpaceEngine {
     reverb: Pt2399Reverb,
@@ -85,16 +85,17 @@ impl SpaceEngine {
         self.out_norm = Pt2399Reverb::output_norm_for(fb);
 
         // Character toggle shapes tone/modulation and enables shimmer.
+        // Widened for knob impact (bench: SPACE controls too subtle).
         let (tone_scale, mod_scale, shimmer_on) = match mode {
-            SpaceMode::Dark => (0.45, 0.4, false),
-            SpaceMode::Modulated => (0.8, 1.0, false),
-            SpaceMode::Shimmer => (0.9, 0.6, true),
+            SpaceMode::Dark => (0.5, 0.6, false),
+            SpaceMode::Modulated => (1.0, 1.0, false),
+            SpaceMode::Shimmer => (0.9, 0.7, true),
         };
         self.reverb
             .set_tone((p.space_tone() * tone_scale).clamp(0.0, 1.0));
         self.reverb
             .set_mod((p.space_mod() * mod_scale).clamp(0.0, 1.0));
-        self.reverb.set_rate(0.3 + p.space_mod() * 0.8);
+        self.reverb.set_rate(0.2 + p.space_mod() * 1.6);
 
         // Shimmer feeds the pitch-shifted tail back through the chip input.
         // The tank amplifies any injection by its resonant gain ~1/(1-fb), so

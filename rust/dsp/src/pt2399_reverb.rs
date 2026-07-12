@@ -30,7 +30,7 @@ const ALLPASS_TUNING: [usize; 2] = [556, 441];
 const REF_FS: f32 = 44_100.0;
 const ALLPASS_FB: f32 = 0.5;
 /// Max modulation depth in samples (applied to comb read positions).
-const MOD_DEPTH_MAX: f32 = 28.0;
+const MOD_DEPTH_MAX: f32 = 64.0;
 /// Refresh the (expensive) comb-modulation sine only every N samples. The LFO is
 /// slow (< a few Hz), so block-rate refresh is inaudible but saves 3 of every 4
 /// `sinf` calls per comb — real CPU headroom in the 96 kHz audio ISR.
@@ -157,7 +157,13 @@ impl Pt2399Reverb {
     /// tails, never LOUDER ones. Engine and tests share this law.
     #[inline]
     pub fn output_norm_for(fb: f32) -> f32 {
-        (4.0 * (1.0 - fb.min(0.995))).clamp(0.08, 1.0)
+        // Softened from strict constant-peak (4·(1−fb)) — that law made the
+        // decay/regen knobs self-cancelling (longer but proportionally
+        // quieter = "super subtle" on the bench). Peaks now grow moderately
+        // with regen, bounded by the resonant regression test at
+        // commercial-reverb levels; the true howl (age loop gain) has its own
+        // fix + guard.
+        1.0 / (1.0 + 4.0 * (fb.min(1.0) - 0.72).max(0.0))
     }
 
     /// Modulation amount (0..1) → comb-tap detune depth.
@@ -406,7 +412,7 @@ mod tests {
         let _ = r.process(1.0, 0.0); // impulse
         let min_comb = (1116.0 * (FS / 44_100.0)) as usize; // shortest comb, scaled
         let mut early_peak = 0.0f32;
-        for _ in 0..(min_comb - 64) {
+        for _ in 0..(min_comb - 96) {
             early_peak = early_peak.max(r.process(0.0, 0.0).abs());
         }
         assert!(
@@ -552,8 +558,9 @@ mod tests {
             }
             let g = pout / pin;
             assert!(
-                g < 1.6,
-                "normalized resonant gain must stay bounded: fb={fb} gain={g}"
+                g < 2.6,
+                "normalized resonant gain must stay bounded (commercial-reverb \
+                 levels): fb={fb} gain={g}"
             );
         }
     }
